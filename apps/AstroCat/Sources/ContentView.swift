@@ -64,18 +64,29 @@ final class CanvasView: MTKView {
     }
 }
 
-/// The pipeline is a stored property, not read off the renderer, so SwiftUI sees
-/// the struct change and actually calls updateNSView. A change it cannot see is
-/// a change it will not redraw for — the oldest bug in this project.
+/// Stretch parameters are stored properties, not read off the renderer, so
+/// SwiftUI sees the struct change and actually calls updateNSView.
 struct MetalImageView: NSViewRepresentable {
     let renderer: Renderer
-    var ops: [OpSlot] = []
-    var before = OpSlot()
-    /// Below zero draws no comparison at all, which is the ordinary case.
-    var splitX: Float = -1
+    let shadows: SIMD3<Float>
+    let midtone: SIMD3<Float>
+    var calOffset = SIMD3<Float>(repeating: 0)
+    var calGain = SIMD3<Float>(repeating: 1)
+    var paletteR = SIMD3<Float>(1, 0, 0)
+    var paletteG = SIMD3<Float>(0, 1, 0)
+    var paletteB = SIMD3<Float>(0, 0, 1)
+    var algorithm: Int32 = 1
+    var p0: Float = 10
+    var p1: Float = 0.2
+    var blend: Float = 1
+    var saturation: Float = 1
+    var zonesOn: Int32 = 0
+    var tone = ToneParams()
     var detail = DetailParams()
-    /// One 256-entry curve per Zone balance stage, in stack order.
-    var zoneTables: [[Float]] = []
+    var ops: [Int32] = [1, 2, 3, 4, 5]
+    /// Stored, not pushed straight to the renderer: a change SwiftUI cannot
+    /// see is a change it will not redraw for.
+    var zoneTable: [Float] = []
     var viewport = Viewport()
     /// Gestures report in view terms; only the owner knows what to do with
     /// them, so they are handed straight up.
@@ -104,11 +115,23 @@ struct MetalImageView: NSViewRepresentable {
 
     func updateNSView(_ view: MTKView, context: Context) {
         renderer.viewport = viewport
+        renderer.shadows = shadows
+        renderer.midtone = midtone
+        renderer.calOffset = calOffset
+        renderer.calGain = calGain
+        renderer.paletteR = paletteR
+        renderer.paletteG = paletteG
+        renderer.paletteB = paletteB
+        renderer.algorithm = algorithm
+        renderer.p0 = p0
+        renderer.p1 = p1
+        renderer.blend = blend
+        renderer.saturation = saturation
+        renderer.zonesOn = zonesOn
+        renderer.tone = tone
         renderer.detail = detail
         renderer.ops = ops
-        renderer.before = before
-        renderer.splitX = splitX
-        if !zoneTables.isEmpty { renderer.setZones(zoneTables) }
+        if !zoneTable.isEmpty { renderer.setZones(zoneTable) }
         view.draw()
     }
 }

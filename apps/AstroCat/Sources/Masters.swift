@@ -109,28 +109,46 @@ struct ZoneCurve: Equatable, Codable {
 }
 
 /// Everything the Develop module lets you change, in a form that survives a
-/// relaunch.
-///
-/// The stages themselves carry their own parameters, so this is the stack plus
-/// the handful of things that belong to the frame rather than to any one stage.
-/// Measurements are deliberately absent: the colour calibration is re-fitted
+/// relaunch. Measurements are deliberately absent: the calibration is re-fitted
 /// from the frame rather than trusted from a file that may now describe
 /// different pixels.
 struct DevelopSettings: Codable, Equatable {
-    /// Optional so a file written before stages carried their own parameters
-    /// still decodes — it simply falls back to the template. A non-optional
-    /// field with a default does not fall back when the key is missing; it
-    /// throws, and the whole file is discarded as unreadable.
-    var stack: [OpInstance]?
+    var algorithm: Int32 = 1
+    var p0: Float = 10
+    var p1: Float = 0.2
+    var blend: Float = 1
+    var black: Float = 0
+    var midtone: Float = 0.25
+    var midtoneBase: Float = 0.25
+    var p0Base: Float = 10
+    var linked = false
+    var saturation: Float = 1.15
+    var linearMode = true
+    var displayOnly = true
     var sampleTolerance: Float = 2
+    var colourOn = false
     var colourReference: Int32 = 1
     var white: String = WhiteReference.g2v.rawValue
+    var paletteOn = false
+    var palette: String = Palette.natural.rawValue
+    var mix = PaletteMix()
+    var zonesOn = false
+    var zones = ZoneCurve()
+    var toneOn = false
+    var tone = ToneParams()
+    var detail = DetailParams()
     /// Orientation only. Where you were looking is not an edit, so zoom and pan
-    /// are reset rather than restored. A crop is an edit.
+    /// are reset rather than restored.
     var rotation = 0
     var flipH = false
     var flipV = false
+    /// Zoom and pan are deliberately absent — where you were looking last time
+    /// is not an edit. A crop is.
     var crop = SIMD4<Float>(0, 0, 1, 1)
+    /// Optional so a file written before they existed still decodes. A
+    /// non-optional field with a default does not fall back when the key is
+    /// missing — it throws, and the whole file is discarded as unreadable.
+    var stretchOn: Bool?
     var separationOn: Bool?
 
     static func load(_ master: String) -> DevelopSettings? {
@@ -221,4 +239,66 @@ struct DetailParams: Equatable, Codable {
     var radius: Float = 10
 
     var isIdentity: Bool { clarity == 0 && texture == 0 }
+}
+
+/// The order operations run in. Two edges are fixed because moving them would
+/// make an operation meaningless rather than merely different; everything else
+/// is the user's call.
+enum Pipeline {
+    /// Shader op codes. 0 is a no-op.
+    static func code(_ name: String) -> Int32 {
+        switch name {
+        case "Colour calibration": return 1
+        case "Narrowband palette": return 2
+        case "Screen stretch": return 3
+        case "Zone balance": return 4
+        case "Tone": return 5
+        default: return 0
+        }
+    }
+
+    /// The spine, in the one order it can run.
+    ///
+    /// `Master` is first and does no processing: it is the source, and having it
+    /// in the list gives the untouched frame somewhere to live — a place to
+    /// re-crop or start over without a separate mode. `Star separation` splits
+    /// the pipeline, so it sits after the measurements that need a complete
+    /// frame.
+    static let fixed: [String] = [
+        "Master", "Background extraction", "Colour calibration", "Star separation",
+        "Screen stretch",
+    ]
+
+    static func isFixed(_ name: String) -> Bool { fixed.contains(name) }
+
+    static let linearOnly: Set<String> = ["Colour calibration", "Background extraction"]
+
+    /// Why an arrangement is refused, or nil when it is allowed.
+    static func rejection(_ order: [String]) -> String? {
+        for (i, name) in order.enumerated() where isFixed(name) {
+            guard i < fixed.count, fixed[i] == name else {
+                return
+                    "\(name) runs on linear data, before the stretch that ends it. Those three have one possible order, so they stay put."
+            }
+        }
+
+        guard let stretch = order.firstIndex(of: "Screen stretch") else { return nil }
+        for (i, name) in order.enumerated() where linearOnly.contains(name) {
+            if i > stretch {
+                return
+                    "\(name) has to run before the screen stretch. Its maths assumes the data is still linear in photons, and the stretch is what makes it not."
+            }
+        }
+        return nil
+    }
+
+    /// Arrangements that are allowed but rarely wanted.
+    static func warning(_ order: [String], scnr: Bool, palette: Bool) -> String? {
+        guard scnr, palette,
+            let tone = order.firstIndex(of: "Tone"),
+            let mix = order.firstIndex(of: "Narrowband palette"), tone > mix
+        else { return nil }
+        return
+            "SCNR runs after the palette here. It pulls green toward the average of red and blue on the grounds that green is sensor cast — but after a narrowband palette green is OIII, so this will erase the emission line the palette exists to show."
+    }
 }

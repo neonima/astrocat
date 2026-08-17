@@ -1,14 +1,13 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// One stage of the pipeline, with its own parameters.
-///
-/// Every stage carries a full set rather than reaching for a shared one, which
-/// is what lets the same operation appear more than once — two Tone stages that
-/// push different amounts, a second Zone balance after a palette. Only the
-/// fields its `code` reads are populated; the rest cost a few bytes and save a
-/// union.
-struct OpSlot {
+struct Uniforms {
+    /// Columns of the map from normalised device coordinates to texture
+    /// coordinates. Zoom, pan, rotation, flip and the aspect fit are all
+    /// resolved into this on the CPU, so the shader only multiplies.
+    float2 viewX;
+    float2 viewY;
+    float2 viewC;
     float3 shadows;
     float3 midtone;
     float3 calOffset;
@@ -16,10 +15,12 @@ struct OpSlot {
     float3 paletteR;
     float3 paletteG;
     float3 paletteB;
+    int algorithm;
     float p0;
     float p1;
     float blend;
     float saturation;
+    int zonesOn;
     float exposure;
     float contrast;
     float toneHighlights;
@@ -28,37 +29,6 @@ struct OpSlot {
     float blacks;
     float vibrance;
     float scnr;
-    int code;
-    int algorithm;
-    /// Which 256-entry block of the zone buffer this stage reads, so several
-    /// Zone balance stages can each hold a different curve.
-    int lut;
-};
-
-/// The Swift side writes these bytes and the shader reads them; nothing checks
-/// that the two agree, and a drift would be a silent misread rather than a
-/// compile error. Measured: Swift reports size 172, stride 176, alignment 16.
-static_assert(sizeof(OpSlot) == 176, "OpSlot no longer matches the Swift struct");
-static_assert(alignof(OpSlot) == 16, "OpSlot alignment no longer matches Swift");
-
-struct Uniforms {
-    /// Columns of the map from normalised device coordinates to texture
-    /// coordinates. Zoom, pan, rotation, flip and the aspect fit are all
-    /// resolved into this on the CPU, so the shader only multiplies.
-    float2 viewX;
-    float2 viewY;
-    float2 viewC;
-    /// The as-stacked comparison, drawn by this same shader rather than by a
-    /// second view overlaid and masked. Two views have to agree on layout to
-    /// line up, and when they do not the seam is invisible as a cause and very
-    /// visible as an effect.
-    OpSlot before;
-    /// Fragments left of this, in screen units, show `before`. Below zero shows
-    /// none of it; at or above one shows nothing else.
-    float splitX;
-    /// Neighbourhood work stays global: it needs a blurred copy of the whole
-    /// frame at that point, so it drives the two-pass render and cannot be
-    /// instanced the way the per-pixel stages can.
     float clarity;
     float texture;
     int opCount;
@@ -151,7 +121,7 @@ static inline float3 relight(float3 v, float from, float to) {
 /// uses: exposure as a soft compression rather than a multiply so highlights
 /// roll instead of clipping, contrast as a cubic that pins both ends, and
 /// blacks/whites as range remaps.
-static inline float tone_luma(constant OpSlot &u, float l) {
+static inline float tone_luma(constant Uniforms &u, float l) {
     if (abs(u.exposure) > 1e-6) {
         float scale = exp2(u.exposure * (u.exposure > 0.0 ? 0.72 : 0.62));
         l = (l * scale) / (1.0 + l * (scale - 1.0));
@@ -178,7 +148,7 @@ static inline float tone_luma(constant OpSlot &u, float l) {
 
 /// Shadows and highlights act through smooth masks on the pre-adjustment
 /// luminance, so a lift stays in the band it was aimed at.
-static inline float tone_bands(constant OpSlot &u, float l, float base) {
+static inline float tone_bands(constant Uniforms &u, float l, float base) {
     if (abs(u.toneHighlights) > 1e-6) {
         float mask = pow(saturate((base - 0.25) / 0.75), 1.3);
         if (u.toneHighlights < 0.0) {
@@ -231,15 +201,15 @@ fragment float4 f_composite(VOut in [[stage_in]],
     return float4(saturate(relight(base, bl, saturate(bl + detail))), 1.0);
 }
 
-static inline float3 op_calibrate(constant OpSlot &u, float3 v) {
+static inline float3 op_calibrate(constant Uniforms &u, float3 v) {
     return (v - u.calOffset) * u.calGain;
 }
 
-static inline float3 op_palette(constant OpSlot &u, float3 v) {
+static inline float3 op_palette(constant Uniforms &u, float3 v) {
     return float3(dot(u.paletteR, v), dot(u.paletteG, v), dot(u.paletteB, v));
 }
 
-static inline float3 op_stretch(constant OpSlot &u, float3 v, constant float *lut) {
+static inline float3 op_stretch(constant Uniforms &u, float3 v, constant float *lut) {
     float3 c = saturate((v - u.shadows) / max(float3(1e-6), 1.0 - u.shadows));
     float3 o = c;
     switch (u.algorithm) {
@@ -263,7 +233,7 @@ static inline float3 op_zones(float3 v, constant float *zones) {
     return float3(zone_curve(zones, v.r), zone_curve(zones, v.g), zone_curve(zones, v.b));
 }
 
-static inline float3 op_tone(constant OpSlot &u, float3 v) {
+static inline float3 op_tone(constant Uniforms &u, float3 v) {
     const float3 W = float3(0.2126, 0.7152, 0.0722);
     float base = dot(v, W);
     float toned = tone_bands(u, tone_luma(u, base), base);
@@ -289,7 +259,7 @@ fragment float4 f_image(VOut in [[stage_in]],
                         constant Uniforms &u [[buffer(0)]],
                         constant float *lut [[buffer(1)]],
                         constant float *zones [[buffer(2)]],
-                        constant OpSlot *ops [[buffer(3)]]) {
+                        constant int *ops [[buffer(3)]]) {
     // Mip filtering is not optional at full resolution. Fitting 3840 rows into
     // a few hundred pixels of pane point-samples a periodic subset, and on
     // 1-2px stars that reads as a regular lattice rather than a star field.
@@ -301,18 +271,13 @@ fragment float4 f_image(VOut in [[stage_in]],
     }
     float3 v = tex.sample(s, in.uv).rgb;
 
-    if (in.screen.x < u.splitX) {
-        return float4(saturate(op_stretch(u.before, v, lut)), 1.0);
-    }
-
     for (int i = 0; i < u.opCount; i++) {
-        constant OpSlot &s = ops[i];
-        switch (s.code) {
-            case 1: v = op_calibrate(s, v); break;
-            case 2: v = op_palette(s, v); break;
-            case 3: v = op_stretch(s, v, lut); break;
-            case 4: v = op_zones(v, zones + s.lut * 256); break;
-            case 5: v = op_tone(s, v); break;
+        switch (ops[i]) {
+            case 1: v = op_calibrate(u, v); break;
+            case 2: v = op_palette(u, v); break;
+            case 3: v = op_stretch(u, v, lut); break;
+            case 4: v = op_zones(v, zones); break;
+            case 5: v = op_tone(u, v); break;
         }
     }
     return float4(saturate(v), 1.0);

@@ -202,7 +202,7 @@ final class DevelopModel: ObservableObject {
 
     /// The frame as stacked. Everything derived from it inherits its geometry
     /// and its calibration, so it stays loaded whether or not it is on screen.
-    let master = LayerState(template: Ops.template(for: nil))
+    let master = LayerState()
     @Published private(set) var starless: LayerState?
     @Published private(set) var stars: LayerState?
 
@@ -247,155 +247,49 @@ final class DevelopModel: ObservableObject {
         layers != nil && starless != nil && stars != nil && sharedOn.contains("Star separation")
     }
 
-    /// The two stacks hold different instances, so a stage id from one layer
-    /// names nothing in the other. Carrying the *kind* across keeps the
-    /// inspector on the thing you were working on; without this, switching
-    /// layers left the selection pointing at nothing, which reads as every
-    /// control silently refusing to do anything.
-    func select(_ layer: Layer) {
-        guard layer != activeLayer else { return }
-        let wanted = selectedName
-        activeLayer = layer
-        guard case .stage = selection else { return }
-        if let match = active.stack.first(where: { $0.kind == wanted }) {
-            selection = .stage(match.id)
-        } else {
-            selection = .head("Master")
-        }
-    }
 
-    /// One layer back to its template, leaving the other alone. The layers are
-    /// independent everywhere else, so undoing a mess on one should not cost
-    /// the work on the other.
-    func resetLayer(_ layer: Layer) {
-        guard let s = state(for: layer) else { return }
-        objectWillChange.send()
-        s.clear(template: Ops.template(for: layer))
-        var stretch = s.stretch
-        stretch.linked = layer == .stars
-        let base = baseline(for: s).midtone
-        stretch.midtone = stretch.linked ? (base.x + base.y + base.z) / 3 : base.y
-        stretch.midtoneBase = stretch.midtone
-        s.stretch = stretch
-        if activeLayer == layer { selection = .head("Master") }
-        push()
-    }
-
-    /// Which stages are switched on, per layer. The whole class of confusion
-    /// here is a stage being on somewhere you are not looking, so both lists are
-    /// shown side by side rather than only the selected one's.
-    func stagesOn(_ layer: Layer) -> String {
-        guard let s = state(for: layer) else { return "—" }
-        let on = s.stack.filter(\.on).map { $0.kind == "Colour calibration" ? "cal" : $0.kind }
-        return on.isEmpty ? "nothing on" : on.joined(separator: ", ").lowercased()
-    }
-
-    /// What each layer is actually running, for the readout in the layer bar.
-    /// Stage count is what you asked for; slot count is what reached the shader,
-    /// and the two differing is the whole diagnosis when a control does nothing.
-    func pipelineSummary(_ layer: Layer) -> String {
-        guard let s = state(for: layer) else { return "—" }
-        let on = s.stack.filter(\.on).count
-        return "\(on)/\(s.stack.count) on · \(s.renderer.ops.count) applied"
-    }
+    func select(_ layer: Layer) { activeLayer = layer }
 
     func path(for layer: Layer) -> String? { state(for: layer)?.path }
 
     // MARK: Operations
 
-    /// Which stage the inspector is editing.
+    /// The order operations run in, shared across layers: rearranging the
+    /// pipeline is a decision about the pipeline, not about one picture.
+    @Published var order: [String] = [
+        "Master", "Background extraction", "Colour calibration", "Star separation",
+        "Screen stretch", "Narrowband palette", "Zone balance", "Tone", "Curves",
+        "Noise reduction",
+    ]
+
+    /// The spine: the source, a stack-time stage, and the split itself. Nothing
+    /// here is a treatment of a picture, so nothing here belongs to a layer.
     ///
-    /// A stage is addressed by identity, not by index, so reordering the stack
-    /// or switching to a layer with a different stack cannot silently point the
-    /// panels at someone else's parameters.
-    enum Selection: Hashable {
-        /// Above the split, so it belongs to the frame.
-        case head(String)
-        case stage(UUID)
-        case output
-    }
-
-    @Published var selection: Selection = .head("Master") {
-        didSet {
-            if selection == .stage(colourStageID ?? UUID()), colorCal == nil { measureColour() }
-        }
-    }
-
-    /// Whether the spine stages are on. Only these are shared: the source, the
-    /// stack-time extraction, and the split itself. Everything else lives in a
-    /// layer's own stack.
+    /// Colour calibration is deliberately *not* one of them. Its measurement is
+    /// master-level by necessity — it reads star photometry and a starless layer
+    /// has none — but applying it is a choice per picture, and having the switch
+    /// be shared meant ticking it while the star layer was selected transformed
+    /// the pane you were not editing.
+    static let sharedOps: Set<String> = [
+        "Master", "Background extraction", "Star separation",
+    ]
     @Published private var sharedOn: Set<String> = ["Master", "Background extraction"]
 
-    var stack: [OpInstance] { active.stack }
-
-    private var colourStageID: UUID? {
-        active.stack.first { $0.kind == "Colour calibration" }?.id
+    /// Built rather than stored. A parallel array of switches and description
+    /// strings has to be kept in step by hand in as many places as there are
+    /// ways to change a value, and every pane that has worn the wrong label so
+    /// far has been one of those places missed.
+    var operations: [(name: String, state: String, on: Bool)] {
+        order.map { (name: $0, state: describe($0), on: isOn($0)) }
     }
 
-    /// The rows the sidebar shows: the shared head, this layer's stack, the
-    /// pinned result. Built rather than stored — a parallel array of switches
-    /// and labels has to be kept in step by hand in as many places as there are
-    /// ways to change a value, and every stale label so far was one of those
-    /// places missed.
-    struct Row: Identifiable {
-        let id: Selection
-        let name: String
-        let state: String
-        let on: Bool
-        let fixed: Bool
-        /// Nil for a head or the output row.
-        let stage: OpInstance?
+    func isOn(_ name: String) -> Bool { isOn(name, for: active) }
 
-        var isSpine: Bool { stage == nil }
+    private func isOn(_ name: String, for s: LayerState) -> Bool {
+        Self.sharedOps.contains(name) ? sharedOn.contains(name) : s.enabled.contains(name)
     }
 
-    var rows: [Row] {
-        var out = Ops.head.map { name in
-            Row(
-                id: .head(name), name: name, state: describeHead(name),
-                on: sharedOn.contains(name), fixed: true, stage: nil)
-        }
-        out += active.stack.map { op in
-            Row(
-                id: .stage(op.id), name: op.kind,
-                state: op.kind == "Colour calibration"
-                    ? (op.on
-                        ? colourState : (colorCal == nil ? "not measured" : "measured · not applied"))
-                    : op.summary(paletteName: Self.paletteName(op.mix, op.palette)),
-                on: op.on, fixed: false, stage: op)
-        }
-        out.append(
-            Row(
-                id: .output, name: Ops.tail, state: outputState, on: true, fixed: true,
-                stage: nil))
-        return out
-    }
-
-    var selectedName: String {
-        switch selection {
-        case .head(let n): return n
-        case .output: return Ops.tail
-        case .stage(let id): return active.stack.first { $0.id == id }?.kind ?? "Master"
-        }
-    }
-
-    /// The stage the panels edit, or nil when a spine row is selected.
-    var stage: OpInstance? {
-        guard case .stage(let id) = selection else { return nil }
-        return active.stack.first { $0.id == id }
-    }
-
-    /// Reads and writes the selected stage. Everything the panels bind to goes
-    /// through here, which is what makes a second Tone stage genuinely second
-    /// rather than another view of the first.
-    func editStage(_ body: (inout OpInstance) -> Void) {
-        guard case .stage(let id) = selection, let i = active.index(of: id) else { return }
-        objectWillChange.send()
-        body(&active.stack[i])
-        push()
-    }
-
-    private func describeHead(_ name: String) -> String {
+    private func describe(_ name: String) -> String {
         switch name {
         case "Master":
             return "as stacked"
@@ -404,138 +298,28 @@ final class DevelopModel: ObservableObject {
                 ? String(
                     format: "degree 2 · removed %.0f×", gradientBefore / max(gradientAfter, 1e-9))
                 : "degree 2 · one-sided rejection"
-        default:
+        case "Colour calibration":
+            guard isOn(name) else {
+                return colorCal == nil ? "not measured" : "measured · not applied"
+            }
+            return colourState
+        case "Star separation":
             if separating { return "running \(StarSeparation.remover(removerID).name)…" }
             guard layers != nil else { return "not separated" }
             return separated ? "starless + stars" : "layers cached"
+        case "Screen stretch":
+            return "\(active.displayOnly ? "display only" : "baked") · "
+                + "\(active.linked ? "linked" : "unlinked") "
+                + (active.algorithm == .stf ? "STF" : active.algorithm.label.lowercased())
+        case "Narrowband palette":
+            return isOn(name) ? paletteName.lowercased() : "natural"
+        case "Zone balance":
+            return isOn(name) && !active.zones.isIdentity ? "custom" : "even"
+        case "Tone":
+            return isOn(name) && !active.tone.isIdentity ? "adjusted" : "neutral"
+        default:
+            return "not implemented"
         }
-    }
-
-    private var outputState: String {
-        separated ? "merged · \(activeLayer.rawValue.lowercased()) selected" : "single frame"
-    }
-
-    // MARK: Stack editing
-
-    func setStage(_ id: UUID, on: Bool) {
-        guard let i = active.index(of: id) else { return }
-        objectWillChange.send()
-        active.stack[i].on = on
-        // Calibration moves the stretch onto a different baseline, so it is the
-        // one switch that has to do more than redraw.
-        if active.stack[i].kind == "Colour calibration" {
-            if on, colorCal == nil {
-                measureColour()
-                push()
-            } else {
-                applyBaseline()
-            }
-            return
-        }
-        push()
-    }
-
-    func setHead(_ name: String, on: Bool) {
-        if name == "Star separation" {
-            guard layers != nil else {
-                if on { separateStars() }
-                return
-            }
-            objectWillChange.send()
-            if on {
-                sharedOn.insert(name)
-                if starless == nil || stars == nil { attachLayers(for: master.path) }
-            } else {
-                sharedOn.remove(name)
-            }
-            push()
-            return
-        }
-        objectWillChange.send()
-        if on { sharedOn.insert(name) } else { sharedOn.remove(name) }
-        push()
-    }
-
-    /// Adds a stage at the first position that is legal for it, so the common
-    /// case needs no dragging at all.
-    func addStage(_ kind: String) {
-        objectWillChange.send()
-        let op = OpInstance(kind: kind)
-        var next = active.stack
-        // Last legal slot: a new stage is nearly always meant to act on what is
-        // already there rather than before it.
-        var placed = false
-        for i in stride(from: next.count, through: 0, by: -1) {
-            var trial = next
-            trial.insert(op, at: i)
-            if Placement.refusal(trial) == nil {
-                next = trial
-                placed = true
-                break
-            }
-        }
-        if !placed { next.append(op) }
-        active.stack = next
-        selection = .stage(op.id)
-        orderError = nil
-        push()
-    }
-
-    func duplicateStage(_ id: UUID) {
-        guard let i = active.index(of: id) else { return }
-        let kind = Ops.kind(active.stack[i].kind)
-        guard active.stack.filter({ $0.kind == kind.id }).count < kind.maxInstances else {
-            orderError = kind.single ?? "Already at \(kind.maxInstances)."
-            return
-        }
-        objectWillChange.send()
-        var copy = active.stack[i]
-        copy.id = UUID()
-        active.stack.insert(copy, at: i + 1)
-        selection = .stage(copy.id)
-        orderError = nil
-        push()
-    }
-
-    func removeStage(_ id: UUID) {
-        guard let i = active.index(of: id) else { return }
-        if active.stack[i].isStretch {
-            orderError =
-                "The stretch is what makes linear data visible. Removing it leaves a black frame, so it stays."
-            return
-        }
-        objectWillChange.send()
-        active.stack.remove(at: i)
-        if selection == .stage(id) { selection = .head("Master") }
-        orderError = nil
-        push()
-    }
-
-    /// Which positions a drag could legally land in, so the sidebar can show the
-    /// answer during the gesture rather than refusing after it.
-    func legalTargets(for id: UUID) -> Set<Int> {
-        guard let op = active.stack.first(where: { $0.id == id }) else { return [] }
-        return Placement.legalTargets(for: op, in: active.stack)
-    }
-
-    @discardableResult
-    func moveStage(_ id: UUID, to index: Int) -> Bool {
-        guard let from = active.index(of: id), from != index,
-            active.stack.indices.contains(index)
-        else { return false }
-
-        var next = active.stack
-        let moved = next.remove(at: from)
-        next.insert(moved, at: min(index, next.count))
-        if let why = Placement.refusal(next) {
-            orderError = why
-            return false
-        }
-        objectWillChange.send()
-        orderError = nil
-        active.stack = next
-        push()
-        return true
     }
 
     // MARK: Parameters, forwarded to the selected layer
@@ -548,31 +332,22 @@ final class DevelopModel: ObservableObject {
         body(active)
     }
 
-    /// The stretch stage's parameters, reached directly rather than through the
-    /// selection. There is one stretch per layer and it is the tonal baseline
-    /// everything else is expressed against, so the histogram's black point and
-    /// link toggle mean the same thing whatever stage happens to be open.
-    private func editStretch(_ body: (inout OpInstance) -> Void) {
-        objectWillChange.send()
-        var s = active.stretch
-        body(&s)
-        active.stretch = s
-        push()
-    }
-
     var algorithm: Algorithm {
-        get { Algorithm(rawValue: active.stretch.algorithm) ?? .stf }
+        get { active.algorithm }
         set {
-            guard newValue.rawValue != active.stretch.algorithm else { return }
-            editStretch { $0.algorithm = newValue.rawValue }
+            guard newValue != active.algorithm else { return }
+            edit { $0.algorithm = newValue }
             autoFit()
             push()
         }
     }
 
     var linked: Bool {
-        get { active.stretch.linked }
-        set { editStretch { $0.linked = newValue } }
+        get { active.linked }
+        set {
+            edit { $0.linked = newValue }
+            push()
+        }
     }
 
     /// Every algorithm gets fitted the way STF is — solve its parameter so the
@@ -602,15 +377,14 @@ final class DevelopModel: ObservableObject {
             return Float((lo * hi).squareRoot())
         }
 
-        var stretch = s.stretch
         var fitted: Float?
-        switch Algorithm(rawValue: stretch.algorithm) ?? .stf {
+        switch s.algorithm {
         case .arcsinh:
             fitted = solve { k, x in asinh(k * x) / asinh(k) }
         case .logarithmic:
             fitted = solve { k, x in log(1 + k * x) / log(1 + k) }
         case .hyperbolic:
-            stretch.p1 = Float(bg)
+            s.p1 = Float(bg)
             fitted = solve { d, x in
                 let sp = bg
                 let span = max(1 - sp, sp)
@@ -620,100 +394,97 @@ final class DevelopModel: ObservableObject {
             fitted = nil
         }
 
-        if let fitted {
-            let offBaseline = preserving && stretch.p0Base > 1e-6 ? stretch.p0 / stretch.p0Base : 1
-            stretch.p0Base = fitted
-            stretch.p0 = min(1_000_000, max(1, fitted * offBaseline))
-        }
-        s.stretch = stretch
+        guard let fitted else { return }
+        let offBaseline = preserving && s.p0Base > 1e-6 ? s.p0 / s.p0Base : 1
+        s.p0Base = fitted
+        s.p0 = min(1_000_000, max(1, fitted * offBaseline))
     }
 
     var p0: Float {
-        get { active.stretch.p0 }
-        set { editStretch { $0.p0 = newValue } }
+        get { active.p0 }
+        set { edit { $0.p0 = newValue }; push() }
     }
     var p1: Float {
-        get { active.stretch.p1 }
-        set { editStretch { $0.p1 = newValue } }
+        get { active.p1 }
+        set { edit { $0.p1 = newValue }; push() }
     }
     var blend: Float {
-        get { active.stretch.blend }
-        set { editStretch { $0.blend = newValue } }
+        get { active.blend }
+        set { edit { $0.blend = newValue }; push() }
     }
     var black: Float {
-        get { active.stretch.black }
-        set { editStretch { $0.black = newValue } }
+        get { active.black }
+        set { edit { $0.black = newValue }; push() }
     }
     /// Absolute midtone for green; the other channels keep their auto ratio so
     /// dragging it brightens without shifting colour.
     var midtone: Float {
-        get { active.stretch.midtone }
-        set { editStretch { $0.midtone = newValue } }
+        get { active.midtone }
+        set { edit { $0.midtone = newValue }; push() }
+    }
+    var linearMode: Bool {
+        get { active.linearMode }
+        set { edit { $0.linearMode = newValue } }
+    }
+    var displayOnly: Bool {
+        get { active.displayOnly }
+        set { edit { $0.displayOnly = newValue } }
     }
     var saturation: Float {
-        get { active.stretch.saturation }
-        set { editStretch { $0.saturation = newValue } }
+        get { active.saturation }
+        set { edit { $0.saturation = newValue }; push() }
     }
-
-    /// These act on whichever stage is selected, so a second Tone stage is
-    /// genuinely a second one rather than another view of the first.
     var palette: Palette {
-        get { Palette(rawValue: stage?.palette ?? "") ?? .natural }
+        get { active.palette }
         set {
-            editStage {
-                $0.palette = newValue.rawValue
+            edit {
+                $0.palette = newValue
                 $0.mix = newValue.mix
             }
+            push()
         }
     }
     /// Presets seed this; the sliders own it from then on.
     var mix: PaletteMix {
-        get { stage?.mix ?? PaletteMix() }
-        set { editStage { $0.mix = newValue } }
+        get { active.mix }
+        set { edit { $0.mix = newValue }; push() }
     }
     var zones: ZoneCurve {
-        get { stage?.zones ?? ZoneCurve() }
-        set { editStage { $0.zones = newValue } }
+        get { active.zones }
+        set { edit { $0.zones = newValue }; push() }
     }
-    var zoneTable: [Float] { (stage?.zones ?? ZoneCurve()).table() }
+    var zoneTable: [Float] { active.zoneTable }
     var tone: ToneParams {
-        get { stage?.tone ?? ToneParams() }
-        set { editStage { $0.tone = newValue } }
+        get { active.tone }
+        set { edit { $0.tone = newValue }; push() }
     }
     var detail: DetailParams {
-        get { stage?.detail ?? active.detailStage?.detail ?? DetailParams() }
-        set { editStage { $0.detail = newValue } }
+        get { active.detail }
+        set { edit { $0.detail = newValue }; push() }
     }
-
     var histogramRGB: [[Float]] { active.histogramRGB }
-
-    /// What the shader is actually applying, read back off the slots so an
-    /// export bakes in the picture on screen rather than a second derivation
-    /// of it.
-    var bakedStretch: (SIMD3<Float>, SIMD3<Float>) {
-        guard let slot = active.renderer.ops.first(where: { $0.code == 3 }) else {
-            return (.zero, SIMD3(repeating: 0.5))
-        }
-        return (slot.shadows, slot.midtone)
-    }
-
-    var bakedCalibration: (SIMD3<Float>, SIMD3<Float>)? {
-        guard let slot = active.renderer.ops.first(where: { $0.code == 1 }) else { return nil }
-        return (slot.calOffset, slot.calGain)
-    }
     /// The renderer driving whichever picture the inspector is editing.
     var renderer: Renderer { active.renderer }
     var meta: FrameMeta? { master.meta }
     var source: String { master.path }
 
-    @Published var linearMode = true
-    @Published var displayOnly = true
-    /// Unpinned, the two panels fold away and reappear on approach, so an
-    /// untouched view is the whole window.
-    @Published var panelsPinned = true
     @Published var bake = false
     @Published var split: SplitMode = .both
     @Published var holdingB = false
+
+    var selectedName: String {
+        order.indices.contains(selectedOp) ? order[selectedOp] : "Master"
+    }
+
+    @Published var selectedOp = 0 {
+        didSet {
+            if order.indices.contains(selectedOp), order[selectedOp] == "Colour calibration",
+                colorCal == nil
+            {
+                measureColour()
+            }
+        }
+    }
 
     @Published var colorReference: ColorReference = .starField {
         didSet {
@@ -814,11 +585,11 @@ final class DevelopModel: ObservableObject {
         // its cast the way it does on any frame. The star layer has no sky at
         // all — per-channel fitting there has nothing to fit to, and the three
         // midtones diverge until one channel runs away with the picture.
-        starless = makeLayer(layers!.starless.path, layer: .starless)
-        stars = makeLayer(layers!.stars.path, layer: .stars)
+        starless = makeLayer(layers!.starless.path, linked: false)
+        stars = makeLayer(layers!.stars.path, linked: true)
     }
 
-    private func makeLayer(_ path: String, layer: Layer) -> LayerState? {
+    private func makeLayer(_ path: String, linked: Bool) -> LayerState? {
         // On the master's normalisation, not its own. A layer's brightest pixel
         // is nebula where the master's is a star, so left to derive its own
         // scale it lands several times brighter and every inherited number
@@ -826,19 +597,13 @@ final class DevelopModel: ObservableObject {
         guard let f = try? LoadedFrame(url: URL(fileURLWithPath: path), scale: masterScale)
         else { return nil }
 
-        let s = LayerState(template: Ops.template(for: layer))
+        let s = LayerState(linked: linked)
         s.upload(f)
-        let linked = layer == .stars
-        var stretch = s.stretch
-        stretch.linked = linked
-        stretch.saturation = master.stretch.saturation
+        s.saturation = master.saturation
         let base = baseline(for: s).midtone
-        stretch.midtone = linked ? (base.x + base.y + base.z) / 3 : base.y
-        stretch.midtoneBase = stretch.midtone
-        s.stretch = stretch
-        if let saved = DevelopSettings.load(path), let stack = saved.stack, !stack.isEmpty {
-            s.stack = stack
-        }
+        s.midtone = linked ? (base.x + base.y + base.z) / 3 : base.y
+        s.midtoneBase = s.midtone
+        if let saved = DevelopSettings.load(path) { apply(saved, to: s) }
         return s
     }
     @Published var viewport = Viewport() { didSet { scheduleSave() } }
@@ -994,7 +759,7 @@ final class DevelopModel: ObservableObject {
         whiteReference = .g2v
         colorCal = nil
         colorCalReference = nil
-        resetStacks()
+        for s in [master, starless, stars].compactMap({ $0 }) { s.clear() }
         viewport = Viewport()
         cropRatio = nil
         pendingCrop = nil
@@ -1013,16 +778,8 @@ final class DevelopModel: ObservableObject {
         viewport = Viewport()
         sharedOn.remove("Star separation")
         activeLayer = .starless
-        resetStacks()
+        for s in [master, starless, stars].compactMap({ $0 }) { s.clear() }
         revert()
-    }
-
-    /// Every stack back to the template for its kind of picture.
-    private func resetStacks() {
-        master.clear(template: Ops.template(for: nil))
-        starless?.clear(template: Ops.template(for: .starless))
-        stars?.clear(template: Ops.template(for: .stars))
-        selection = .head("Master")
     }
 
     func clearCrop() {
@@ -1037,20 +794,64 @@ final class DevelopModel: ObservableObject {
         viewport.pan = .zero
     }
 
-    var pipelineWarning: String? {
-        Placement.warning(active.stack, paletteActive: paletteActive)
+    /// Drops `name` at `index`. Returns false when the arrangement is refused,
+    /// which the row uses to leave the item where it was.
+    @discardableResult
+    func reorderOperation(_ name: String, to index: Int) -> Bool {
+        guard let from = order.firstIndex(of: name), order.indices.contains(index),
+            from != index, !Pipeline.isFixed(name), !Pipeline.isFixed(order[index])
+        else { return false }
+
+        var next = order
+        let moved = next.remove(at: from)
+        next.insert(moved, at: min(index, next.count))
+        if let why = Pipeline.rejection(next) {
+            orderError = why
+            return false
+        }
+
+        let selectedName = order[selectedOp]
+        orderError = nil
+        order = next
+        selectedOp = order.firstIndex(of: selectedName) ?? selectedOp
+        push()
+        return true
     }
+
+    /// Refuses the move rather than silently reordering into nonsense, and says
+    /// which rule it broke.
+    func move(_ i: Int, by delta: Int) {
+        let j = i + delta
+        guard order.indices.contains(i), order.indices.contains(j),
+            !Pipeline.isFixed(order[i]), !Pipeline.isFixed(order[j])
+        else { return }
+        var next = order
+        next.swapAt(i, j)
+        if let why = Pipeline.rejection(next) {
+            orderError = why
+            return
+        }
+        orderError = nil
+        order = next
+        if selectedOp == i { selectedOp = j } else if selectedOp == j { selectedOp = i }
+        push()
+    }
+
+    var pipelineWarning: String? {
+        Pipeline.warning(order, scnr: toneActive && tone.scnr > 0, palette: paletteActive)
+    }
+    var toneActive: Bool { isOn("Tone") && !tone.isIdentity }
+    var zonesActive: Bool { isOn("Zone balance") && !zones.isIdentity }
     private var restoring = false
     private var saveTimer: Timer?
     private var histogramTimer: Timer?
 
     /// Names the preset the sliders currently sit on, or admits they have moved
     /// off one.
-    static func paletteName(_ mix: PaletteMix, _ palette: String) -> String {
-        if palette == Palette.natural.rawValue { return "Natural" }
+    var paletteName: String {
+        if palette == .natural { return "Natural" }
         return Palette.allCases.first { $0 != .natural && $0.mix == mix }?.rawValue ?? "Custom"
     }
-    var paletteName: String { Self.paletteName(mix, palette.rawValue) }
     private var colorStale = false
     /// Which mode produced `colorCal`, which is not always the selected mode —
     /// a measure can be in flight.
@@ -1060,11 +861,7 @@ final class DevelopModel: ObservableObject {
     /// uncalibrated data — a different picture from the app's default.
     private var linkedBeforeCalibration: Bool?
 
-    var paletteActive: Bool {
-        active.stack.contains {
-            $0.kind == "Narrowband palette" && $0.on && $0.palette != Palette.natural.rawValue
-        }
-    }
+    var paletteActive: Bool { isOn("Narrowband palette") && palette != .natural }
     var calibrationActive: Bool { calibrated(active) }
 
     /// One measurement, made on the master; each picture decides whether to wear
@@ -1072,7 +869,52 @@ final class DevelopModel: ObservableObject {
     /// choice on this data — the extracted star layer is red-deficient, so the
     /// same gains that neutralise the sky push its stars cyan.
     private func calibrated(_ s: LayerState) -> Bool {
-        s.stack.contains { $0.kind == "Colour calibration" && $0.on } && colorCal != nil
+        s.enabled.contains("Colour calibration") && colorCal != nil
+    }
+
+    func setOperation(_ i: Int, _ on: Bool) {
+        guard order.indices.contains(i) else { return }
+        let name = order[i]
+
+        if name == "Star separation" {
+            // Ticking it should enter the split, or produce the layers if they
+            // are not there yet — not set a flag that changes nothing.
+            guard layers != nil else {
+                if on { separateStars() }
+                return
+            }
+            objectWillChange.send()
+            if on {
+                sharedOn.insert(name)
+                if starless == nil || stars == nil { attachLayers(for: master.path) }
+            } else {
+                sharedOn.remove(name)
+            }
+            push()
+            return
+        }
+
+        objectWillChange.send()
+        if Self.sharedOps.contains(name) {
+            if on { sharedOn.insert(name) } else { sharedOn.remove(name) }
+        } else if on {
+            active.enabled.insert(name)
+        } else {
+            active.enabled.remove(name)
+        }
+
+        // Calibration moves the stretch onto a different baseline, so it is the
+        // one switch that has to do more than redraw.
+        guard name == "Colour calibration" else {
+            push()
+            return
+        }
+        if on, colorCal == nil {
+            measureColour()
+            push()
+        } else {
+            applyBaseline()
+        }
     }
 
     /// Off the main thread because this may plate-solve: when the frame has no
@@ -1175,21 +1017,18 @@ final class DevelopModel: ObservableObject {
     /// toggling calibration is not a request to throw it away.
     private func applyBaseline() {
         let s = active
-        var stretch = s.stretch
         if calibrationActive {
-            if linkedBeforeCalibration == nil { linkedBeforeCalibration = stretch.linked }
-            stretch.linked = true
+            if linkedBeforeCalibration == nil { linkedBeforeCalibration = s.linked }
+            s.linked = true
         } else if let previous = linkedBeforeCalibration {
-            stretch.linked = previous
+            s.linked = previous
             linkedBeforeCalibration = nil
         }
-        s.stretch = stretch
 
         let base = baseline(for: s).midtone.y
-        let offBaseline = stretch.midtoneBase > 1e-6 ? stretch.midtone / stretch.midtoneBase : 1
-        stretch.midtoneBase = base
-        stretch.midtone = min(0.999, max(0.001, base * offBaseline))
-        s.stretch = stretch
+        let offBaseline = s.midtoneBase > 1e-6 ? s.midtone / s.midtoneBase : 1
+        s.midtoneBase = base
+        s.midtone = min(0.999, max(0.001, base * offBaseline))
         autoFit(preserving: true)
         push()
     }
@@ -1204,7 +1043,7 @@ final class DevelopModel: ObservableObject {
     /// master it came from.
     private func baseline(for s: LayerState) -> (shadows: SIMD3<Float>, midtone: SIMD3<Float>) {
         if calibrated(s), let c = colorCal {
-            return s.stretch.linked
+            return s.linked
                 ? (SIMD3(repeating: c.linkedShadows), SIMD3(repeating: c.linkedMidtone))
                 : (c.shadows, c.midtone)
         }
@@ -1215,17 +1054,22 @@ final class DevelopModel: ObservableObject {
     }
 
     private func settings(_ s: LayerState) -> DevelopSettings {
-        var d = DevelopSettings()
-        d.stack = s.stack
-        d.sampleTolerance = sampleTolerance
-        d.colourReference = colorReference.rawValue
-        d.white = whiteReference.rawValue
-        d.rotation = viewport.rotation
-        d.flipH = viewport.flipH
-        d.flipV = viewport.flipV
-        d.crop = viewport.crop
-        d.separationOn = sharedOn.contains("Star separation")
-        return d
+        DevelopSettings(
+            algorithm: s.algorithm.rawValue, p0: s.p0, p1: s.p1, blend: s.blend, black: s.black,
+            midtone: s.midtone, midtoneBase: s.midtoneBase, p0Base: s.p0Base, linked: s.linked,
+            saturation: s.saturation, linearMode: s.linearMode, displayOnly: s.displayOnly,
+            sampleTolerance: sampleTolerance,
+            colourOn: s.enabled.contains("Colour calibration"),
+            colourReference: colorReference.rawValue,
+            white: whiteReference.rawValue,
+            paletteOn: s.enabled.contains("Narrowband palette"), palette: s.palette.rawValue,
+            mix: s.mix,
+            zonesOn: s.enabled.contains("Zone balance"), zones: s.zones,
+            toneOn: s.enabled.contains("Tone"), tone: s.tone, detail: s.detail,
+            rotation: viewport.rotation, flipH: viewport.flipH, flipV: viewport.flipV,
+            crop: viewport.crop,
+            stretchOn: s.enabled.contains("Screen stretch"),
+            separationOn: sharedOn.contains("Star separation"))
     }
 
     /// Written on a short delay so dragging a slider does not write a file per
@@ -1244,6 +1088,36 @@ final class DevelopModel: ObservableObject {
                 self.savedAt = Date()
             }
         }
+    }
+
+    /// The layer-scoped half of a settings file. Geometry and the operation
+    /// order are not here: those belong to the frame, and applying them per
+    /// layer is how the two panes drifted out of register.
+    private func apply(_ d: DevelopSettings, to s: LayerState) {
+        s.algorithm = Algorithm(rawValue: d.algorithm) ?? .stf
+        s.p0 = d.p0
+        s.p1 = d.p1
+        s.p0Base = d.p0Base
+        s.blend = d.blend
+        s.black = d.black
+        s.midtone = d.midtone
+        s.midtoneBase = d.midtoneBase
+        s.linked = d.linked
+        s.saturation = d.saturation
+        s.linearMode = d.linearMode
+        s.displayOnly = d.displayOnly
+        s.palette = Palette(rawValue: d.palette) ?? .natural
+        s.mix = d.mix
+        s.zones = d.zones
+        s.tone = d.tone
+        s.detail = d.detail
+
+        s.enabled = []
+        if d.stretchOn ?? true { s.enabled.insert("Screen stretch") }
+        if d.colourOn { s.enabled.insert("Colour calibration") }
+        if d.paletteOn { s.enabled.insert("Narrowband palette") }
+        if d.zonesOn { s.enabled.insert("Zone balance") }
+        if d.toneOn { s.enabled.insert("Tone") }
     }
 
     /// The half that belongs to the frame rather than to a layer.
@@ -1290,18 +1164,9 @@ final class DevelopModel: ObservableObject {
     @Published var exportTarget: ExportTarget = .siril
     @Published var exportError: String?
 
-    /// The as-stacked view. Still its own renderer for the merged pane, where
-    /// the comparison really is a second picture; the single-frame split draws
-    /// it as a branch in the same shader instead.
+    /// The as-stacked view. Its own renderer because one renderer cannot drive
+    /// two views: whichever drew last would set the uniforms for both.
     let beforeRenderer = Renderer()
-
-    /// The frame as it came out of the stack, as one stretch stage. This is what
-    /// the shader shows on the left of the seam.
-    var beforeSlot: OpSlot {
-        beforeRenderer.ops.first ?? OpSlot.stf(
-            shadows: master.meta?.shadows ?? .zero,
-            midtone: master.meta?.midtone ?? SIMD3(repeating: 0.25))
-    }
 
     var pairingWrong: Bool { algorithm.wantsLinear != linearMode }
 
@@ -1328,17 +1193,17 @@ final class DevelopModel: ObservableObject {
 
         restoring = true
         masterScale = f.meta.fullScale
-        master.clear(template: Ops.template(for: nil))
+        master.clear()
         master.upload(f)
-        var stretch = master.stretch
-        stretch.midtone = f.meta.midtone.y
-        stretch.midtoneBase = f.meta.midtone.y
-        master.stretch = stretch
+        master.midtone = f.meta.midtone.y
+        master.midtoneBase = f.meta.midtone.y
 
         beforeRenderer.upload(f)
-        beforeRenderer.ops = [
-            OpSlot.stf(shadows: f.meta.shadows, midtone: f.meta.midtone)
-        ]
+        beforeRenderer.shadows = f.meta.shadows
+        beforeRenderer.midtone = f.meta.midtone
+        beforeRenderer.algorithm = Algorithm.stf.rawValue
+        beforeRenderer.saturation = 1
+        beforeRenderer.blend = 1
 
         colorCal = nil
         colorCalReference = nil
@@ -1361,10 +1226,9 @@ final class DevelopModel: ObservableObject {
 
         let saved = DevelopSettings.load(path)
         if let saved {
-            if let stack = saved.stack, !stack.isEmpty { master.stack = stack }
+            apply(saved, to: master)
             applyShared(saved)
         }
-        selection = .head("Master")
         restoring = false
 
         savedAt = saved == nil ? nil : Masters.modified(Masters.settingsURL(for: path))
@@ -1373,7 +1237,7 @@ final class DevelopModel: ObservableObject {
         push()
         computeHistogram()
         let wanted = ([master] + [starless, stars].compactMap { $0 })
-            .contains { s in s.stack.contains { $0.kind == "Colour calibration" && $0.on } }
+            .contains { $0.enabled.contains("Colour calibration") }
         if wanted || selectedName == "Colour calibration" {
             // A measurement, not a setting — re-fitted from the frame rather
             // than trusted from a file that may describe other pixels.
@@ -1412,12 +1276,16 @@ final class DevelopModel: ObservableObject {
         let n = m.width * m.height
         guard n > 0 else { return }
 
-        // Walks the same slot list the shader walks, so a second Tone stage or
-        // a second Zone balance shows up here too. Anything that needs a
-        // neighbourhood is absent from both — a histogram of local contrast is
-        // not a thing a histogram can show.
-        let slots = s.renderer.ops
-        let curves = s.zoneTables
+        let r = s.renderer
+        let shadows = r.shadows
+        let midtones = r.midtone
+        let offset = r.calOffset
+        let gain = r.calGain
+        let rows = (r.paletteR, r.paletteG, r.paletteB)
+        let curve = zonesActive ? s.zoneTable : nil
+        let algo = s.algorithm
+        let p0 = s.p0
+        let p1 = s.p1
         let pixels = f.pixels
 
         // One flat buffer rather than three nested arrays: the inner loop runs
@@ -1428,12 +1296,20 @@ final class DevelopModel: ObservableObject {
 
         flat.withUnsafeMutableBufferPointer { bins in
             for i in stride(from: 0, to: n, by: 16) {
-                var v = SIMD3<Float>(
+                let raw = SIMD3<Float>(
                     Float(pixels[i * 4]), Float(pixels[i * 4 + 1]), Float(pixels[i * 4 + 2])
                 ) / 65535
-                v = Self.evaluate(v, slots: slots, zones: curves)
+                let cal = (raw - offset) * gain
+                let mixed = SIMD3<Float>(
+                    simd_dot(rows.0, cal), simd_dot(rows.1, cal), simd_dot(rows.2, cal))
+
                 for c in 0..<3 {
-                    bins[c * 256 + min(255, max(0, Int(v[c] * 255)))] += 1
+                    let sh = shadows[c]
+                    let v = max(0, min(1, (mixed[c] - sh) / max(1e-6, 1 - sh)))
+                    var out = Self.stretched(
+                        v, algorithm: algo, midtone: midtones[c], p0: p0, p1: p1)
+                    if let curve { out = curve[min(255, max(0, Int(out * 255)))] }
+                    bins[c * 256 + min(255, max(0, Int(out * 255)))] += 1
                 }
                 counted += 1
             }
@@ -1451,59 +1327,19 @@ final class DevelopModel: ObservableObject {
             acc += s.histogramRGB[1][i]
             cdf[i] = acc
         }
-        s.renderer.setEqualisation(cdf)
-    }
-
-    /// The per-pixel half of the shader, in Swift. Kept next to the shader in
-    /// behaviour rather than in code, which is a real duplication — but the
-    /// alternative is a histogram of pixels nobody is looking at.
-    private static func evaluate(
-        _ input: SIMD3<Float>, slots: [OpSlot], zones: [[Float]]
-    ) -> SIMD3<Float> {
-        var v = input
-        for slot in slots {
-            switch slot.code {
-            case 1:
-                v = (v - slot.calOffset) * slot.calGain
-            case 2:
-                v = SIMD3(
-                    simd_dot(slot.paletteR, v), simd_dot(slot.paletteG, v),
-                    simd_dot(slot.paletteB, v))
-            case 3:
-                let algo = Algorithm(rawValue: slot.algorithm) ?? .stf
-                for c in 0..<3 {
-                    let sh = slot.shadows[c]
-                    let x = max(0, min(1, (v[c] - sh) / max(1e-6, 1 - sh)))
-                    v[c] = stretched(
-                        x, algorithm: algo, midtone: slot.midtone[c], p0: slot.p0, p1: slot.p1)
-                }
-            case 4:
-                let table = zones.indices.contains(Int(slot.lut)) ? zones[Int(slot.lut)] : nil
-                if let table {
-                    for c in 0..<3 {
-                        v[c] = table[min(255, max(0, Int(v[c] * 255)))]
-                    }
-                }
-            default:
-                continue
-            }
-        }
-        return simd_clamp(v, .zero, SIMD3(repeating: 1))
+        r.setEqualisation(cdf)
     }
 
     /// The transfer one channel is on, for drawing. Same path the shader takes,
     /// so the curve is the one being applied.
     func stretchCurve(_ channel: Int) -> [Float] {
-        guard let slot = active.renderer.ops.first(where: { $0.code == 3 }) else {
-            return (0..<256).map { Float($0) / 255 }
-        }
-        let algo = Algorithm(rawValue: slot.algorithm) ?? .stf
-        let sh = slot.shadows[channel]
-        let mid = slot.midtone[channel]
+        let s = active
+        let sh = s.renderer.shadows[channel]
+        let mid = s.renderer.midtone[channel]
         return (0..<256).map { i in
             let v = Float(i) / 255
             let n = max(0, min(1, (v - sh) / max(1e-6, 1 - sh)))
-            return Self.stretched(n, algorithm: algo, midtone: mid, p0: slot.p0, p1: slot.p1)
+            return Self.stretched(n, algorithm: s.algorithm, midtone: mid, p0: s.p0, p1: s.p1)
         }
     }
 
@@ -1536,88 +1372,71 @@ final class DevelopModel: ObservableObject {
 
     private func configure(_ s: LayerState) {
         let r = s.renderer
-        let base = baseline(for: s)
-        var zone: Int32 = 0
+        r.algorithm = s.algorithm.rawValue
+        r.p0 = s.p0
+        r.p1 = s.p1
+        r.blend = s.blend
+        r.saturation = s.saturation
 
-        r.ops = s.stack.compactMap { op -> OpSlot? in
-            guard op.on else { return nil }
-            let code = Ops.code(op.kind)
-            // A Zone balance stage consumes a curve slot whether or not it is
-            // switched on, or the indices would shift as stages are toggled.
-            guard code != 0 else { return nil }
-
-            var slot = OpSlot()
-            slot.code = code
-            switch op.kind {
-            case "Colour calibration":
-                guard let c = colorCal else { return nil }
-                slot.calOffset = c.offset
-                slot.calGain = c.gain
-            case "Narrowband palette":
-                let palette = Palette(rawValue: op.palette) ?? .natural
-                guard palette != .natural else { return nil }
-                let rows = op.mix.rows
-                slot.paletteR = rows.0
-                slot.paletteG = rows.1
-                slot.paletteB = rows.2
-            case "Screen stretch":
-                slot.algorithm = op.algorithm
-                slot.p0 = op.p0
-                slot.p1 = op.p1
-                slot.blend = op.blend
-                slot.saturation = op.saturation
-                var shadows = simd_clamp(
-                    base.shadows + SIMD3(repeating: op.black), .zero, SIMD3(repeating: 0.99))
-                let ratio = base.midtone.y > 1e-6 ? op.midtone / base.midtone.y : 1
-                // Linked applies one curve to all three, so a genuinely coloured
-                // target keeps its colour instead of being neutralised.
-                var midtone = simd_clamp(
-                    base.midtone * ratio, SIMD3(repeating: 0.001), SIMD3(repeating: 0.999))
-                if op.linked {
-                    shadows = SIMD3(repeating: (shadows.x + shadows.y + shadows.z) / 3)
-                    midtone = SIMD3(repeating: op.midtone)
-                }
-                slot.shadows = shadows
-                slot.midtone = midtone
-            case "Zone balance":
-                guard !op.zones.isIdentity else { return nil }
-                slot.lut = s.zoneIndex(of: op.id)
-                zone += 1
-            case "Tone":
-                guard !op.tone.isIdentity else { return nil }
-                slot.exposure = op.tone.exposure
-                slot.contrast = op.tone.contrast
-                slot.toneHighlights = op.tone.highlights
-                slot.toneShadows = op.tone.shadows
-                slot.whites = op.tone.whites
-                slot.blacks = op.tone.blacks
-                slot.vibrance = op.tone.vibrance
-                slot.scnr = op.tone.scnr
-            default:
-                return nil
-            }
-            return slot
+        if calibrated(s), let c = colorCal {
+            r.calOffset = c.offset
+            r.calGain = c.gain
+        } else {
+            r.calOffset = .zero
+            r.calGain = SIMD3(repeating: 1)
         }
 
-        r.setZones(s.zoneTables)
-        r.detail = s.detailStage?.detail ?? DetailParams()
+        let paletteOn = s.enabled.contains("Narrowband palette") && s.palette != .natural
+        let rows = paletteOn ? s.mix.rows : PaletteMix.identity
+        r.paletteR = rows.0
+        r.paletteG = rows.1
+        r.paletteB = rows.2
+        r.setZones(s.zoneTable)
+        r.zonesOn = (s.enabled.contains("Zone balance") && !s.zones.isIdentity) ? 1 : 0
+        let toneOn = s.enabled.contains("Tone")
+        r.tone = toneOn && !s.tone.isIdentity ? s.tone : ToneParams()
+        r.detail = toneOn ? s.detail : DetailParams()
+
+        // The order the sidebar shows, minus whatever is switched off for this
+        // picture. Order belongs to the pipeline; the switches do not.
+        r.ops = order.compactMap { name in
+            let code = Pipeline.code(name)
+            guard code != 0, isOn(name, for: s) else { return nil }
+            return code
+        }
+
+        guard s.meta != nil else { return }
+        let base = baseline(for: s)
+        var shadows = simd_clamp(
+            base.shadows + SIMD3(repeating: s.black), .zero, SIMD3(repeating: 0.99))
+        let ratio = base.midtone.y > 1e-6 ? s.midtone / base.midtone.y : 1
+        // Linked applies one curve to all three, so a genuinely coloured target
+        // keeps its colour instead of being neutralised.
+        var midtone = simd_clamp(
+            base.midtone * ratio, SIMD3(repeating: 0.001), SIMD3(repeating: 0.999))
+        if s.linked {
+            shadows = SIMD3(repeating: (shadows.x + shadows.y + shadows.z) / 3)
+            midtone = SIMD3(repeating: s.midtone)
+        }
+        r.shadows = shadows
+        r.midtone = midtone
     }
 
     func revert() {
         let s = active
-        let fitted = baseline(for: s).midtone.y
-        editStretch {
-            $0.algorithm = Algorithm.stf.rawValue
+        edit {
+            $0.algorithm = .stf
             $0.p0 = 10
             $0.p0Base = 10
             $0.p1 = 0.2
             $0.blend = 1
             $0.black = 0
             $0.saturation = 1
-            $0.midtone = fitted
-            $0.midtoneBase = fitted
+            $0.midtone = baseline(for: s).midtone.y
+            $0.midtoneBase = $0.midtone
         }
         dirty = false
+        push()
     }
 }
 
@@ -1626,39 +1445,14 @@ struct DevelopModule: View {
     @ObservedObject var stacker: StackModel
     @ObservedObject var sky: SkyCatalogue
     @Environment(\.tokens) private var t
-    /// Which stage is under the cursor, so the rows that could accept it can
-    /// say so while the drag is happening.
-    @State private var dragging: UUID?
-    @State private var hoveringLeft = false
-    @State private var hoveringRight = false
-
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
-                if model.panelsPinned {
-                    sidebar.frame(width: 240, alignment: .leading).background(t.s1)
-                    Divider().overlay(t.line)
-                }
+                sidebar.frame(width: 240, alignment: .leading).background(t.s1)
+                Divider().overlay(t.line)
                 canvas
-                if model.panelsPinned {
-                    Divider().overlay(t.line)
-                    inspector.frame(width: 316, alignment: .leading).background(t.s1)
-                }
-            }
-        }
-        // Unpinned, the panels come back on approach and float over the picture
-        // rather than taking width from it. Nothing is lost — the sliders work
-        // the same — but an untouched view is the whole canvas.
-        .overlay(alignment: .leading) {
-            if !model.panelsPinned {
-                floating(sidebar.frame(width: 240), edge: .leading, showing: hoveringLeft)
-                    .onHover { hoveringLeft = $0 }
-            }
-        }
-        .overlay(alignment: .trailing) {
-            if !model.panelsPinned {
-                floating(inspector.frame(width: 316), edge: .trailing, showing: hoveringRight)
-                    .onHover { hoveringRight = $0 }
+                Divider().overlay(t.line)
+                inspector.frame(width: 316, alignment: .leading).background(t.s1)
             }
         }
         .onAppear {
@@ -1696,13 +1490,55 @@ struct DevelopModule: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                header("Operations")
-                Spacer()
-                addMenu
-            }
-            ForEach(model.rows) { row in
-                stackRow(row)
+            header("Operations")
+            ForEach(Array(model.operations.enumerated()), id: \.offset) { i, op in
+                Button { model.selectedOp = i } label: {
+                    HStack(alignment: .top, spacing: Space.md) {
+                        // The master is the source, not a step: there is nothing
+                        // to switch off, so it gets alignment rather than a
+                        // checkbox that could only ever be ticked.
+                        if op.name == "Master" {
+                            Color.clear.frame(width: 14, height: 14)
+                        } else {
+                            Toggle(
+                                "",
+                                isOn: Binding(
+                                    get: { model.operations[i].on },
+                                    set: { model.setOperation(i, $0) })
+                            )
+                            .toggleStyle(.checkbox).labelsHidden()
+                        }
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(op.name).font(Face.body)
+                                .foregroundStyle(op.on || op.name == "Master" ? t.t1 : t.t3)
+                            Text(op.state).font(Face.mono(10)).foregroundStyle(t.t4)
+                        }
+                        Spacer()
+                        if Pipeline.isFixed(op.name) {
+                            Text("fixed").font(Face.mono(9)).foregroundStyle(t.t4)
+                        } else {
+                            Image(systemName: "line.3.horizontal")
+                                .font(.system(size: 9))
+                                .foregroundStyle(i == model.selectedOp ? t.t2 : t.t4)
+                        }
+                    }
+                    .padding(.horizontal, Space.sm)
+                    .padding(.vertical, Space.sm)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(i == model.selectedOp ? t.sel : .clear)
+                    // A clear background and a Spacer are both transparent to
+                    // hit testing, which left only the label clickable.
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .ifMovable(op.name) { view in
+                    view
+                        .draggable(op.name)
+                        .dropDestination(for: String.self) { items, _ in
+                            guard let name = items.first else { return false }
+                            return model.reorderOperation(name, to: i)
+                        }
+                }
             }
 
             if let why = model.orderError {
@@ -1722,105 +1558,11 @@ struct DevelopModule: View {
             Text("ORDER MATTERS")
                 .font(Face.sectionHeader).tracking(Face.sectionTracking)
                 .foregroundStyle(t.t3)
-            Text("These run top to bottom, and rearranging them changes the result. Master, the split and the result are pinned; everything between them is yours to arrange, and a stage will only accept a position its maths survives. Add the same stage twice to push a value further than one pass can.")
+            Text("These run top to bottom, and rearranging them changes the result. Two edges are fixed: anything measured on linear data has to precede the stretch, and colour calibration has to precede the palette. Move one of those and it will say why rather than quietly obeying.")
                 .font(Face.secondary).foregroundStyle(t.t3)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(Metric.panelPad)
-    }
-
-    /// Every stage that could still be added, with the ones that cannot greyed
-    /// and saying why — a refusal you can read beats one you have to discover.
-    private var addMenu: some View {
-        Menu {
-            ForEach(Ops.addable(to: model.stack), id: \.kind.id) { entry in
-                Button {
-                    model.addStage(entry.kind.id)
-                } label: {
-                    Text(entry.refusal == nil ? entry.kind.id : "\(entry.kind.id) — \(entry.refusal!)")
-                }
-                .disabled(entry.refusal != nil)
-            }
-        } label: {
-            Image(systemName: "plus").font(.system(size: 10)).foregroundStyle(t.t2)
-                .frame(width: 18, height: 16)
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .frame(width: 22)
-        .help("Add a stage. It lands at the last position its maths allows.")
-    }
-
-    @ViewBuilder
-    private func stackRow(_ row: DevelopModel.Row) -> some View {
-        let selected = model.selection == row.id
-        let dropping = draggingTarget(row)
-
-        Button { model.selection = row.id } label: {
-            HStack(alignment: .top, spacing: Space.md) {
-                // Master and the result are the frame's ends, not steps: there
-                // is nothing to switch off, so they get alignment rather than a
-                // checkbox that could only ever be ticked.
-                if row.name == "Master" || row.id == .output {
-                    Color.clear.frame(width: 14, height: 14)
-                } else {
-                    Toggle(
-                        "",
-                        isOn: Binding(
-                            get: { row.on },
-                            set: { on in
-                                if case .stage(let id) = row.id {
-                                    model.setStage(id, on: on)
-                                } else {
-                                    model.setHead(row.name, on: on)
-                                }
-                            })
-                    )
-                    .toggleStyle(.checkbox).labelsHidden()
-                }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(row.name).font(Face.body)
-                        .foregroundStyle(row.on || row.isSpine ? t.t1 : t.t3)
-                    Text(row.state).font(Face.mono(10)).foregroundStyle(t.t4)
-                }
-                Spacer()
-                if row.fixed {
-                    Text("fixed").font(Face.mono(9)).foregroundStyle(t.t4)
-                } else {
-                    Image(systemName: "line.3.horizontal")
-                        .font(.system(size: 9))
-                        .foregroundStyle(selected ? t.t2 : t.t4)
-                }
-            }
-            .padding(.horizontal, Space.sm)
-            .padding(.vertical, Space.sm)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(selected ? t.sel : (dropping ? t.s3 : .clear))
-            .overlay(alignment: .top) {
-                if dropping { Rectangle().fill(t.q5).frame(height: 1.5) }
-            }
-            // A clear background and a Spacer are both transparent to hit
-            // testing, which left only the label clickable.
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            if case .stage(let id) = row.id {
-                Button("Duplicate") { model.duplicateStage(id) }
-                Button("Remove", role: .destructive) { model.removeStage(id) }
-            }
-        }
-        .modifier(StageDrag(model: model, row: row, dragging: $dragging))
-    }
-
-    /// Whether this row is a position the stage being dragged could legally take.
-    /// Shown during the gesture, so an illegal drop is visibly not offered
-    /// rather than refused after the fact.
-    private func draggingTarget(_ row: DevelopModel.Row) -> Bool {
-        guard let id = dragging, case .stage(let target) = row.id, target != id,
-            let index = model.stack.firstIndex(where: { $0.id == target })
-        else { return false }
-        return model.legalTargets(for: id).contains(index)
     }
 
     /// Orientation and zoom, next to the picture they act on. Rotation and flip
@@ -1867,71 +1609,13 @@ struct DevelopModule: View {
 
             Divider().frame(height: 12).overlay(t.line2)
 
-            Button {
-                model.panelsPinned.toggle()
-            } label: {
-                Image(
-                    systemName: model.panelsPinned
-                        ? "rectangle.inset.filled.and.person.filled"
-                        : "rectangle.on.rectangle"
-                )
-                .font(.system(size: 10))
-                .foregroundStyle(model.panelsPinned ? t.t2 : t.selT)
-                .frame(width: 20, height: 18)
-                .background(model.panelsPinned ? .clear : t.sel)
-                .clipShape(RoundedRectangle(cornerRadius: Radius.control))
-            }
-            .buttonStyle(.plain)
-            .help(
-                model.panelsPinned
-                    ? "Unpin the panels. They fold away and come back when you reach for them."
-                    : "Pin the panels open again.")
-
-            Divider().frame(height: 12).overlay(t.line2)
-
-            icon("minus.magnifyingglass") { model.zoomBy(1 / 1.4) }
+                        icon("minus.magnifyingglass") { model.zoomBy(1 / 1.4) }
             Button(model.zoomLabel) { model.resetView() }
                 .buttonStyle(.plain).font(Face.mono(10)).foregroundStyle(t.t2)
                 .frame(width: 46)
                 .help("Fit to the pane. Double-clicking the image does the same.")
             icon("plus.magnifyingglass") { model.zoomBy(1.4) }
         }
-    }
-
-    /// A strip at the edge to aim at, and the panel itself once the cursor is
-    /// in it. Both live in the same hover region so the panel does not vanish
-    /// the moment you reach for a slider.
-    @ViewBuilder
-    private func floating<V: View>(_ panel: V, edge: HorizontalAlignment, showing: Bool)
-        -> some View
-    {
-        HStack(spacing: 0) {
-            if edge == .trailing, !showing {
-                grabStrip
-            }
-            if showing {
-                panel
-                    .background(t.s1)
-                    .overlay(alignment: edge == .leading ? .trailing : .leading) {
-                        Divider().overlay(t.line)
-                    }
-                    .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 0)
-                    .transition(.move(edge: edge == .leading ? .leading : .trailing))
-            }
-            if edge == .leading, !showing {
-                grabStrip
-            }
-        }
-        .animation(.easeOut(duration: 0.12), value: showing)
-    }
-
-    private var grabStrip: some View {
-        Rectangle()
-            .fill(t.line.opacity(0.5))
-            .frame(width: 3)
-            .frame(maxHeight: .infinity)
-            .padding(.horizontal, 5)
-            .contentShape(Rectangle())
     }
 
     private func icon(_ name: String, _ run: @escaping () -> Void) -> some View {
@@ -2043,34 +1727,8 @@ struct DevelopModule: View {
                     },
                     set: { model.select(DevelopModel.Layer.allCases[$0]) }))
 
-            // What each layer is running, side by side. Stages you switched on
-            // against stages that reached the shader: when a control appears to
-            // do nothing, those two numbers say which half is at fault.
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(DevelopModel.Layer.allCases, id: \.rawValue) { layer in
-                    HStack(alignment: .top, spacing: Space.sm) {
-                        Text(layer.rawValue).font(Face.mono(9))
-                            .foregroundStyle(model.activeLayer == layer ? t.q5 : t.t4)
-                            .frame(width: 48, alignment: .leading)
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text(model.stagesOn(layer)).font(Face.mono(9))
-                                .foregroundStyle(t.t3)
-                                .fixedSize(horizontal: false, vertical: true)
-                            Text(model.pipelineSummary(layer)).font(Face.mono(9))
-                                .foregroundStyle(t.t4)
-                        }
-                        Spacer()
-                        Button("reset") { model.resetLayer(layer) }
-                            .buttonStyle(.plain).font(Face.mono(9))
-                            .foregroundStyle(t.t4)
-                            .help("Put this layer back to its template. The other layer is untouched.")
-                    }
-                }
-            }
-            .padding(.top, Space.xs)
-
             Text(
-                Ops.isSpine(model.selectedName)
+                Pipeline.isFixed(model.selectedName)
                     ? "\(model.selectedName) sits above the split, so it belongs to the frame and both layers inherit it."
                     : "Every control below belongs to the \(model.activeLayer.rawValue.lowercased()) layer alone. The other keeps its own, and the merged pane is the two of them screened together."
             )
@@ -2101,11 +1759,10 @@ struct DevelopModule: View {
                     case "Narrowband palette": palettePanel
                     case "Zone balance": zonePanel
                     case "Tone": tonePanel
-                    case "Detail": detailPanel
-                    case "Output": outputPanel
                     default: unimplemented
                     }
 
+                    editAndExport
                     Spacer()
                 }
                 .padding(Metric.panelPad)
@@ -2393,8 +2050,9 @@ struct DevelopModule: View {
                         suggested: Exporter.suggestedName(
                             model.exportTarget, frames: 0,
                             exposure: model.meta?.exposure ?? 60, filter: "LP"),
-                        stretch: model.bakedStretch,
-                        calibration: model.bakedCalibration)
+                        stretch: (model.renderer.shadows, model.renderer.midtone),
+                        calibration: model.calibrationActive
+                            ? (model.renderer.calOffset, model.renderer.calGain) : nil)
                 }
                 act("Advanced…") {}
             }
@@ -2607,17 +2265,7 @@ struct DevelopModule: View {
             toneSlider("SCNR", \.scnr, 0...1)
             note("Pulls green down to the average of red and blue. Green above that is almost never real on a deep sky frame — there are no green stars and no green nebulae, only the sensor's own cast.")
 
-            HStack(spacing: Space.sm) {
-                act("Neutral") { model.tone = ToneParams() }
-            }
-                .padding(.top, Space.md)
-        }
-    }
-
-    private var detailPanel: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            note("Local contrast against a blurred copy — coarse for structure, fine for grain. Both act on luminance: sharpening chroma on a colour-sensor frame amplifies demosaic artefacts rather than detail.")
-
+            header("Detail").padding(.top, Space.lg)
             slider(
                 "Clarity",
                 Binding(get: { model.detail.clarity }, set: { model.detail.clarity = $0 }),
@@ -2630,37 +2278,15 @@ struct DevelopModule: View {
                 "Texture",
                 Binding(get: { model.detail.texture }, set: { model.detail.texture = $0 }),
                 -1...1, "%+.2f")
-
-            note("This is the one stage that has to look at a pixel's neighbours, so switching it on puts the view on a two-pass render — and it is why there can only be one of it. Everything else here can be added twice.")
+            note("Local contrast against a blurred copy — coarse for structure, fine for grain. These are the first controls that need to look at a pixel's neighbours, so switching either on puts the view on a two-pass render. Both act on luminance; sharpening chroma on a colour-sensor frame amplifies demosaic artefacts rather than detail.")
 
             HStack(spacing: Space.sm) {
-                act("Neutral") { model.detail = DetailParams() }
+                act("Neutral") {
+                    model.tone = ToneParams()
+                    model.detail = DetailParams()
+                }
             }
-            .padding(.top, Space.md)
-        }
-    }
-
-    /// The end of the pipeline, mirroring Master at the start. No split, no
-    /// comparison — the picture as it will leave the app.
-    private var outputPanel: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            note(
-                model.separated
-                    ? "Both layers, screened back together. Everything above acts on one layer or the other; this is the only view of the result."
-                    : "The frame with every stage above applied, at full resolution and without a comparison split.")
-
-            if let m = model.meta {
-                let size = model.viewport.cropSize
-                let full = SIMD2(
-                    Float(max(m.srcWidth, m.width)), Float(max(m.srcHeight, m.height)))
-                info(
-                    "Resolution",
-                    "\(Int(size.x * full.x)) × \(Int(size.y * full.y)) px")
-                info("Print", PrintSize.describe(px: (Int(size.x * full.x), Int(size.y * full.y))))
-            }
-            info("Stages", "\(model.stack.filter(\.on).count) of \(model.stack.count) on")
-
-            editAndExport
+                .padding(.top, Space.md)
         }
     }
 
@@ -3039,56 +2665,73 @@ struct DevelopCanvas: View {
         case resize(x: Int, y: Int)
     }
 
-    /// Where the seam falls, in screen units. Below zero draws no comparison.
-    private var splitFraction: Float {
-        if model.holdingB { return 2 }
-        switch model.split {
-        case .before: return 2
-        case .after: return -1
-        case .both: return Float(divider)
-        }
-    }
-
     var body: some View {
         GeometryReader { geo in
+            let showBefore = model.holdingB ? true : (model.split != .after)
+            let showAfter = model.holdingB ? false : (model.split != .before)
+
             ZStack(alignment: .topLeading) {
                 tokens.img
 
-                if model.selection == .output {
-                    finalView
-                }
-
-                if model.separated, model.selection != .output {
+                if model.separated {
                     separatedLayout
                 }
 
-                if !model.separated && model.selection != .output {
-                    // One view, one draw. The as-stacked comparison is a branch
-                    // inside the shader rather than a second Metal view overlaid
-                    // and masked: two views have to agree on layout to line up,
-                    // and when they disagree the seam is very visible as an
-                    // effect and invisible as a cause.
+                if showAfter && !model.separated {
                     MetalImageView(
                         renderer: model.renderer,
-                        ops: model.renderer.ops,
-                        before: model.beforeSlot,
-                        splitX: splitFraction,
+                        shadows: model.renderer.shadows,
+                        midtone: model.renderer.midtone,
+                        calOffset: model.renderer.calOffset,
+                        calGain: model.renderer.calGain,
+                        paletteR: model.renderer.paletteR,
+                        paletteG: model.renderer.paletteG,
+                        paletteB: model.renderer.paletteB,
+                        algorithm: model.algorithm.rawValue,
+                        p0: model.p0, p1: model.p1, blend: model.blend,
+                        saturation: model.saturation,
+                        zonesOn: model.renderer.zonesOn,
+                        tone: model.renderer.tone,
                         detail: model.renderer.detail,
-                        zoneTables: model.active.zoneTables,
+                        ops: model.renderer.ops,
+                        zoneTable: model.zoneTable,
                         viewport: model.viewport,
                         onZoom: { model.pinch($0, at: $1, viewAspect: $2) },
                         onPan: { model.drag($0, viewAspect: $1) },
                         onReset: { model.resetView() })
                 }
 
-                if model.split == .both && !model.holdingB && !model.separated
-                    && model.selection != .output
-                {
+                // Guarded like the after pane: without this it draws over the
+                // layer split, masked to half the width, and the result looks
+                // like a before/after of something unrelated.
+                if showBefore && !model.separated {
+                    // Both halves share the viewport, or the split would compare
+                    // two different parts of the frame.
+                    MetalImageView(
+                        renderer: model.beforeRenderer,
+                        shadows: model.meta?.shadows ?? .zero,
+                        midtone: model.meta?.midtone ?? SIMD3(repeating: 0.25),
+                        algorithm: Algorithm.stf.rawValue,
+                        p0: 10, p1: 0.2, blend: 1, saturation: 1,
+                        viewport: model.viewport)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .mask(alignment: .leading) {
+                            Rectangle().frame(
+                                width: model.split == .both && !model.holdingB
+                                    ? geo.size.width * divider : geo.size.width)
+                        }
+                        // A mask hides it but still lets it take events, and it
+                        // carries no handlers — so without this it silently
+                        // swallows every gesture meant for the pane below.
+                        .allowsHitTesting(false)
+                }
+
+                if model.split == .both && !model.holdingB && !model.separated {
                     Rectangle().fill(tokens.line3).frame(width: 1)
                         .offset(x: geo.size.width * divider)
                 }
 
-                if !model.separated && model.selection != .output {
+                if !model.separated {
                     Text("As stacked").font(Face.mono(10)).foregroundStyle(tokens.t2)
                         .padding(Space.md)
                     Text(
@@ -3155,34 +2798,15 @@ struct DevelopCanvas: View {
         if let s = model.state(for: layer) {
             let r = s.renderer
             MetalImageView(
-                renderer: r, ops: r.ops, detail: r.detail, zoneTables: s.zoneTables,
-                viewport: model.viewport,
+                renderer: r, shadows: r.shadows, midtone: r.midtone,
+                calOffset: r.calOffset, calGain: r.calGain,
+                paletteR: r.paletteR, paletteG: r.paletteG, paletteB: r.paletteB,
+                algorithm: r.algorithm, p0: r.p0, p1: r.p1, blend: r.blend,
+                saturation: r.saturation, zonesOn: r.zonesOn, tone: r.tone, detail: r.detail,
+                ops: r.ops, zoneTable: s.zoneTable, viewport: model.viewport,
                 onSelect: selectable ? { model.select(layer) } : nil)
         } else {
             tokens.img
-        }
-    }
-
-    /// The result, and nothing else. Selecting Output is the one place the
-    /// canvas shows a single picture with no comparison and no panes — the
-    /// whole point of it is to look at the thing you have made.
-    @ViewBuilder
-    private var finalView: some View {
-        ZStack(alignment: .topLeading) {
-            if model.separated {
-                mergedView
-            } else {
-                MetalImageView(
-                    renderer: model.renderer,
-                    ops: model.renderer.ops,
-                    detail: model.renderer.detail,
-                    zoneTables: model.active.zoneTables,
-                    viewport: model.viewport,
-                    onZoom: { model.pinch($0, at: $1, viewAspect: $2) },
-                    onPan: { model.drag($0, viewAspect: $1) },
-                    onReset: { model.resetView() })
-            }
-            Text("Output").font(Face.mono(10)).foregroundStyle(tokens.t2).padding(Space.md)
         }
     }
 
@@ -3238,9 +2862,13 @@ struct DevelopCanvas: View {
                 if showBefore {
                     MetalImageView(
                         renderer: model.beforeRenderer,
-                        ops: model.beforeRenderer.ops,
+                        shadows: model.beforeRenderer.shadows,
+                        midtone: model.beforeRenderer.midtone,
+                        algorithm: Algorithm.stf.rawValue,
+                        p0: 10, p1: 0.2, blend: 1, saturation: 1,
                         viewport: model.viewport
                     )
+                    .frame(width: geo.size.width, height: geo.size.height)
                     .mask(alignment: .leading) {
                         Rectangle().frame(
                             width: model.split == .both && !model.holdingB
@@ -3548,30 +3176,11 @@ extension String {
     func ifEmpty(_ fallback: String) -> String { isEmpty ? fallback : self }
 }
 
-/// Drag and drop, applied only to rows that can actually move — a pinned stage
-/// should not offer a gesture that would be refused.
-struct StageDrag: ViewModifier {
-    let model: DevelopModel
-    let row: DevelopModel.Row
-    @Binding var dragging: UUID?
-
-    func body(content: Content) -> some View {
-        guard case .stage(let id) = row.id, !row.fixed else { return AnyView(content) }
-        return AnyView(
-            content
-                .onDrag {
-                    dragging = id
-                    return NSItemProvider(object: id.uuidString as NSString)
-                }
-                .dropDestination(for: String.self) { items, _ in
-                    dragging = nil
-                    guard let dropped = items.first.flatMap(UUID.init(uuidString:)),
-                        let index = model.stack.firstIndex(where: { $0.id == id })
-                    else { return false }
-                    return model.moveStage(dropped, to: index)
-                } isTargeted: { over in
-                    if !over, dragging == id { dragging = nil }
-                }
-        )
+extension View {
+    /// Applies drag and drop only to rows that can actually move, so a fixed
+    /// operation does not offer a gesture that would be refused.
+    @ViewBuilder
+    func ifMovable<V: View>(_ name: String, _ transform: (Self) -> V) -> some View {
+        if Pipeline.isFixed(name) { self } else { transform(self) }
     }
 }

@@ -1,14 +1,15 @@
 import Foundation
 import simd
 
-/// One editable picture: its pixels, its renderer, and its own stack of stages.
+/// One editable picture: its pixels, its renderer, and every parameter that
+/// acts on it.
 ///
-/// A separated frame is two pictures, not one picture with a switch. Each gets a
-/// complete stack because they want different treatment — and increasingly not
-/// even the same *stages*: a star field has no sky whose cast wants neutralising
-/// and no nebulosity to allocate contrast to, so offering it those by default
-/// offers work that cannot help. Holding both live is also what makes selecting
-/// a pane a change of address rather than a file load.
+/// A separated frame is two pictures, not one picture with a switch. Each gets
+/// a complete parameter set because they want opposite treatment — the starless
+/// layer is stretched hard for faint nebulosity, the star layer needs a curve
+/// that does not bloat what it has. Holding both live is also what makes
+/// selecting a pane a change of address rather than a file load: the state is
+/// already there and already rendered, so switching moves nothing.
 @MainActor
 final class LayerState {
     /// One renderer each. A single renderer cannot drive two views — whichever
@@ -18,49 +19,42 @@ final class LayerState {
     var frame: LoadedFrame?
     var meta: FrameMeta?
 
-    /// The stages, in the order they run.
-    var stack: [OpInstance]
+    var algorithm: Algorithm = .stf
+    var p0: Float = 10
+    var p1: Float = 0.2
+    var blend: Float = 1
+    var black: Float = 0
+    var midtone: Float = 0.25
+    var linked = false
+    var saturation: Float = 1.15
+    var linearMode = true
+    var displayOnly = true
+    /// The auto-fitted values the sliders are expressed against, so a change of
+    /// baseline rescales the tuning instead of discarding it.
+    var midtoneBase: Float = 0.25
+    var p0Base: Float = 10
+
+    var palette: Palette = .natural
+    var mix = PaletteMix()
+    var zones = ZoneCurve() {
+        didSet {
+            zoneTable = zones.table()
+            renderer.setZones(zoneTable)
+        }
+    }
+    private(set) var zoneTable: [Float] = ZoneCurve().table()
+    var tone = ToneParams()
+    var detail = DetailParams()
+
+    /// Operations switched on for this picture alone. The spine above the split
+    /// is not in here — it belongs to the master.
+    var enabled: Set<String> = ["Screen stretch"]
 
     var histogramRGB: [[Float]] = Array(
         repeating: Array(repeating: 0, count: 256), count: 3)
 
-    init(template: [OpInstance]) {
-        stack = template
-    }
-
-    /// The one stretch stage. Its parameters are the layer's tonal baseline, so
-    /// they are reached directly rather than through whatever is selected.
-    var stretch: OpInstance {
-        get { stack.first { $0.isStretch } ?? OpInstance(kind: "Screen stretch") }
-        set {
-            guard let i = stack.firstIndex(where: { $0.isStretch }) else { return }
-            stack[i] = newValue
-        }
-    }
-
-    var hasStretch: Bool { stack.contains { $0.isStretch } }
-
-    func index(of id: UUID) -> Int? { stack.firstIndex { $0.id == id } }
-
-    /// Curves in stack order, one per Zone balance stage. A stage's slot carries
-    /// its position in this list.
-    var zoneTables: [[Float]] {
-        stack.filter { $0.kind == "Zone balance" }.map { $0.zones.table() }
-    }
-
-    func zoneIndex(of id: UUID) -> Int32 {
-        var n: Int32 = 0
-        for op in stack {
-            guard op.kind == "Zone balance" else { continue }
-            if op.id == id { return n }
-            n += 1
-        }
-        return 0
-    }
-
-    /// The single Detail stage, which drives the two-pass render.
-    var detailStage: OpInstance? {
-        stack.first { $0.kind == "Detail" && $0.on }
+    init(linked: Bool = false) {
+        self.linked = linked
     }
 
     func upload(_ f: LoadedFrame) {
@@ -68,12 +62,26 @@ final class LayerState {
         meta = f.meta
         path = f.meta.path
         renderer.upload(f)
-        renderer.setZones(zoneTables)
+        renderer.setZones(zoneTable)
     }
 
-    /// Back to the template for this kind of layer. Geometry is absent by
+    /// Everything except the pixels back to its default. Geometry is absent by
     /// design: crop and rotation belong to the frame, not to a layer.
-    func clear(template: [OpInstance]) {
-        stack = template
+    func clear() {
+        algorithm = .stf
+        p0 = 10
+        p0Base = 10
+        p1 = 0.2
+        blend = 1
+        black = 0
+        saturation = 1.15
+        linearMode = true
+        displayOnly = true
+        palette = .natural
+        mix = PaletteMix()
+        zones = ZoneCurve()
+        tone = ToneParams()
+        detail = DetailParams()
+        enabled = ["Screen stretch"]
     }
 }

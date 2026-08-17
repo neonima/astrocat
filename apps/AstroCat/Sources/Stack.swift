@@ -862,22 +862,16 @@ struct ABSplit: View {
                 if model.hasAfter {
                     MetalImageView(
                         renderer: model.afterRenderer,
-                        ops: [
-                            .stf(
-                                shadows: model.afterStretch.shadows,
-                                midtone: model.afterStretch.midtone)
-                        ])
+                        shadows: model.afterStretch.shadows,
+                        midtone: model.afterStretch.midtone)
                 }
                 if model.hasBefore {
                     // Full-size render, masked — resizing the view would
                     // aspect-fit it to the half width and break alignment.
                     MetalImageView(
                         renderer: model.beforeRenderer,
-                        ops: [
-                            .stf(
-                                shadows: model.beforeStretch.shadows,
-                                midtone: model.beforeStretch.midtone)
-                        ])
+                        shadows: model.beforeStretch.shadows,
+                        midtone: model.beforeStretch.midtone)
                         .frame(width: geo.size.width, height: geo.size.height)
                         .mask(alignment: .leading) {
                             Rectangle().frame(width: geo.size.width * divider)

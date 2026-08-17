@@ -7,8 +7,27 @@ struct Uniforms {
     var viewX: SIMD2<Float>
     var viewY: SIMD2<Float>
     var viewC: SIMD2<Float>
-    var before: OpSlot
-    var splitX: Float
+    var shadows: SIMD3<Float>
+    var midtone: SIMD3<Float>
+    var calOffset: SIMD3<Float>
+    var calGain: SIMD3<Float>
+    var paletteR: SIMD3<Float>
+    var paletteG: SIMD3<Float>
+    var paletteB: SIMD3<Float>
+    var algorithm: Int32
+    var p0: Float
+    var p1: Float
+    var blend: Float
+    var saturation: Float
+    var zonesOn: Int32
+    var exposure: Float
+    var contrast: Float
+    var toneHighlights: Float
+    var toneShadows: Float
+    var whites: Float
+    var blacks: Float
+    var vibrance: Float
+    var scnr: Float
     var clarity: Float
     var texture: Float
     var opCount: Int32
@@ -36,13 +55,23 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var zoneLut: MTLBuffer?
     private var imageAspect: Float = 1
 
+    var shadows = SIMD3<Float>(repeating: 0)
+    var midtone = SIMD3<Float>(repeating: 0.5)
+    var calOffset = SIMD3<Float>(repeating: 0)
+    var calGain = SIMD3<Float>(repeating: 1)
+    var paletteR = SIMD3<Float>(1, 0, 0)
+    var paletteG = SIMD3<Float>(0, 1, 0)
+    var paletteB = SIMD3<Float>(0, 0, 1)
+    var algorithm: Int32 = 1
+    var p0: Float = 10
+    var p1: Float = 0.2
+    var blend: Float = 1
+    var saturation: Float = 1
+    var zonesOn: Int32 = 0
+    var tone = ToneParams()
     var detail = DetailParams()
-    /// The stages to run, in order, each with its own parameters.
-    var ops: [OpSlot] = []
-    /// The as-stacked comparison and where the seam falls, drawn by the same
-    /// pass so the two halves cannot be laid out differently.
-    var before = OpSlot()
-    var splitX: Float = -1
+    /// Op codes in the order they should run. See Pipeline.code.
+    var ops: [Int32] = [1, 2, 3, 4, 5]
     var viewport = Viewport()
 
     override init() {
@@ -86,7 +115,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         self.queue = queue
         super.init()
         setEqualisation(Array(repeating: 0, count: 256))
-        setZones([(0..<256).map { Float($0) / 255 }])
+        setZones((0..<256).map { Float($0) / 255 })
     }
 
     /// Loud on failure: a nil pipeline would silently drop the two-pass path
@@ -146,17 +175,11 @@ final class Renderer: NSObject, MTKViewDelegate {
             bytes: v, length: 256 * MemoryLayout<Float>.stride, options: .storageModeShared)
     }
 
-    /// One 256-entry block per Zone balance stage, concatenated. A stage's slot
-    /// carries the index of its own block, so several can hold different curves.
-    func setZones(_ curves: [[Float]]) {
-        var flat = [Float]()
-        for c in curves {
-            flat.append(contentsOf: c.count == 256 ? c : (0..<256).map { Float($0) / 255 })
-        }
-        if flat.isEmpty { flat = (0..<256).map { Float($0) / 255 } }
+    func setZones(_ curve: [Float]) {
+        var v = curve
+        if v.count != 256 { v = (0..<256).map { Float($0) / 255 } }
         zoneLut = device.makeBuffer(
-            bytes: flat, length: flat.count * MemoryLayout<Float>.stride,
-            options: .storageModeShared)
+            bytes: v, length: 256 * MemoryLayout<Float>.stride, options: .storageModeShared)
     }
 
     /// The frame's width over its height, so gesture handling can work out
@@ -195,58 +218,27 @@ final class Renderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
-        guard let pass = view.currentRenderPassDescriptor,
-            let drawable = view.currentDrawable
+        guard let tex = texture,
+            let pass = view.currentRenderPassDescriptor,
+            let drawable = view.currentDrawable,
+            let buffer = queue.makeCommandBuffer()
         else { return }
-        encode(pass, size: view.drawableSize) { $0.present(drawable) }
-    }
 
-    /// Renders into a texture rather than a drawable, so what the shader
-    /// actually produces can be read back and compared. Two panes that should
-    /// look identical are a claim about pixels, and pixels are checkable.
-    func render(width: Int, height: Int) -> [UInt8]? {
-        let d = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
-        d.usage = [.renderTarget, .shaderRead]
-        d.storageMode = .shared
-        guard let target = device.makeTexture(descriptor: d) else { return nil }
-
-        let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = target
-        pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].storeAction = .store
-        pass.colorAttachments[0].clearColor = MTLClearColorMake(0.02, 0.02, 0.02, 1)
-
-        guard
-            encode(pass, size: CGSize(width: width, height: height), present: nil, wait: true)
-        else { return nil }
-
-        var out = [UInt8](repeating: 0, count: width * height * 4)
-        out.withUnsafeMutableBytes { raw in
-            target.getBytes(
-                raw.baseAddress!, bytesPerRow: width * 4,
-                from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
-        }
-        return out
-    }
-
-    @discardableResult
-    private func encode(
-        _ pass: MTLRenderPassDescriptor, size: CGSize,
-        present: ((MTLCommandBuffer) -> Void)? = nil, wait: Bool = false
-    ) -> Bool {
-        guard let tex = texture, let buffer = queue.makeCommandBuffer() else { return false }
-        let m = viewMatrix(size)
+        let m = viewMatrix(view.drawableSize)
         var u = Uniforms(
-            viewX: m.0, viewY: m.1, viewC: m.2, before: before, splitX: splitX,
+            viewX: m.0, viewY: m.1, viewC: m.2, shadows: shadows, midtone: midtone,
+            calOffset: calOffset, calGain: calGain,
+            paletteR: paletteR, paletteG: paletteG, paletteB: paletteB,
+            algorithm: algorithm, p0: p0, p1: p1, blend: blend, saturation: saturation,
+            zonesOn: zonesOn,
+            exposure: tone.exposure, contrast: tone.contrast, toneHighlights: tone.highlights,
+            toneShadows: tone.shadows, whites: tone.whites, blacks: tone.blacks,
+            vibrance: tone.vibrance, scnr: tone.scnr,
             clarity: detail.clarity, texture: detail.texture, opCount: Int32(ops.count),
             maskOutside: 1, crop: viewport.crop)
-        // An empty list still needs a byte to point at, and a slot whose code is
-        // zero is a no-op the loop never reaches.
-        let slots = ops.isEmpty ? [OpSlot()] : ops
 
-        let width = Int(size.width)
-        let height = Int(size.height)
+        let width = Int(view.drawableSize.width)
+        let height = Int(view.drawableSize.height)
         let wantsDetail =
             !detail.isIdentity && offscreen != nil && composite != nil
             && ensureTargets(width, height)
@@ -257,21 +249,20 @@ final class Renderer: NSObject, MTKViewDelegate {
             let scene = sceneTex, let coarse = coarseTex, let fine = fineTex,
             let offPipeline = offscreen, let compPipeline = composite
         else {
-            guard let encoder = buffer.makeRenderCommandEncoder(descriptor: pass) else { return false }
+            guard let encoder = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
             encoder.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
             encoder.setFragmentBuffer(lut, offset: 0, index: 1)
             encoder.setFragmentBuffer(zoneLut, offset: 0, index: 2)
             encoder.setFragmentBytes(
-                slots, length: MemoryLayout<OpSlot>.stride * slots.count, index: 3)
+                ops, length: MemoryLayout<Int32>.stride * max(ops.count, 1), index: 3)
             encoder.setFragmentTexture(tex, index: 0)
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             encoder.endEncoding()
-            present?(buffer)
+            buffer.present(drawable)
             buffer.commit()
-            if wait { buffer.waitUntilCompleted() }
-            return true
+            return
         }
 
         let offDesc = MTLRenderPassDescriptor()
@@ -286,14 +277,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         var offUniforms = u
         offUniforms.maskOutside = 0
 
-        guard let offEncoder = buffer.makeRenderCommandEncoder(descriptor: offDesc) else { return false }
+        guard let offEncoder = buffer.makeRenderCommandEncoder(descriptor: offDesc) else { return }
         offEncoder.setRenderPipelineState(offPipeline)
         offEncoder.setVertexBytes(&offUniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
         offEncoder.setFragmentBytes(&offUniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
         offEncoder.setFragmentBuffer(lut, offset: 0, index: 1)
         offEncoder.setFragmentBuffer(zoneLut, offset: 0, index: 2)
         offEncoder.setFragmentBytes(
-            slots, length: MemoryLayout<OpSlot>.stride * slots.count, index: 3)
+            ops, length: MemoryLayout<Int32>.stride * max(ops.count, 1), index: 3)
         offEncoder.setFragmentTexture(tex, index: 0)
         offEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         offEncoder.endEncoding()
@@ -310,7 +301,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         coarseBlur?.encode(commandBuffer: buffer, sourceTexture: scene, destinationTexture: coarse)
         fineBlur?.encode(commandBuffer: buffer, sourceTexture: scene, destinationTexture: fine)
 
-        guard let compEncoder = buffer.makeRenderCommandEncoder(descriptor: pass) else { return false }
+        guard let compEncoder = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
         compEncoder.setRenderPipelineState(compPipeline)
         compEncoder.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
         compEncoder.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -320,9 +311,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         compEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         compEncoder.endEncoding()
 
-        present?(buffer)
+        buffer.present(drawable)
         buffer.commit()
-        if wait { buffer.waitUntilCompleted() }
-        return true
     }
 }
