@@ -109,17 +109,29 @@ struct MetalImageView: NSViewRepresentable {
         view.isPaused = true
         view.enableSetNeedsDisplay = true
 
-        view.onZoom = { [weak view] factor, at in
-            guard let view, view.bounds.height > 0 else { return }
-            onZoom?(factor, at, Float(view.bounds.width / view.bounds.height))
-        }
-        view.onPan = { onPan?($0, $1) }
-        view.onReset = { onReset?() }
-        view.onSelect = onSelect
+        wire(view)
         return view
     }
 
+    /// Re-bound on every update, not just at creation.
+    ///
+    /// `makeNSView` runs once and captures this struct as it was then, so a
+    /// handler that was nil at creation would stay nil for the life of the view
+    /// however many times SwiftUI re-rendered it with a real one — a control
+    /// that does nothing, with nothing in the code to suggest why.
+    private func wire(_ view: MTKView) {
+        guard let canvas = view as? CanvasView else { return }
+        canvas.onZoom = { [weak canvas] factor, at in
+            guard let canvas, canvas.bounds.height > 0 else { return }
+            onZoom?(factor, at, Float(canvas.bounds.width / canvas.bounds.height))
+        }
+        canvas.onPan = { onPan?($0, $1) }
+        canvas.onReset = { onReset?() }
+        canvas.onSelect = onSelect
+    }
+
     func updateNSView(_ view: MTKView, context: Context) {
+        wire(view)
         renderer.viewport = viewport
         renderer.shadows = shadows
         renderer.midtone = midtone

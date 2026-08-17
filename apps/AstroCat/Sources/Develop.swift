@@ -2869,6 +2869,12 @@ struct DevelopCanvas: View {
                 algorithm: r.algorithm, p0: r.p0, p1: r.p1, blend: r.blend,
                 saturation: r.saturation, zonesOn: r.zonesOn, tone: r.tone, detail: r.detail,
                 ops: r.ops, zoneTable: s.zoneTable, viewport: model.viewport,
+                // Every pane drives the same viewport, so zooming one zooms
+                // all of them. That is not a compromise: the panes are the same
+                // frame twice and have to stay in register to be comparable.
+                onZoom: { model.pinch($0, at: $1, viewAspect: $2) },
+                onPan: { model.drag($0, viewAspect: $1) },
+                onReset: { model.resetView() },
                 onSelect: selectable ? { model.select(layer) } : nil)
         } else {
             tokens.img
