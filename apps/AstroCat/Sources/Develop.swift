@@ -478,12 +478,23 @@ final class DevelopModel: ObservableObject {
 
     @Published var selectedOp = 0 {
         didSet {
-            if order.indices.contains(selectedOp), order[selectedOp] == "Colour calibration",
-                colorCal == nil
-            {
-                measureColour()
-            }
+            // Cropping lives on the master and nowhere else, so leaving it
+            // abandons a marquee rather than leaving one floating over a view
+            // that cannot commit it.
+            if selectedName != "Master", cropping { cancelCrop() }
+            if selectedName == "Colour calibration", colorCal == nil { measureColour() }
         }
+    }
+
+    /// The master is the only surface a crop can be drawn on: it shows the whole
+    /// frame with no comparison split and no layer panes, so a drag there is
+    /// unambiguously the marquee. Everywhere else a drag moves the before/after
+    /// divider, and one gesture cannot mean both without a flag to get wrong.
+    var isMasterView: Bool { selectedName == "Master" }
+
+    func beginCrop() {
+        selectedOp = order.firstIndex(of: "Master") ?? 0
+        cropping = true
     }
 
     @Published var colorReference: ColorReference = .starField {
@@ -1582,7 +1593,7 @@ struct DevelopModule: View {
             Divider().frame(height: 12).overlay(t.line2)
 
             Button {
-                if model.cropping { model.cancelCrop() } else { model.cropping = true }
+                if model.cropping { model.cancelCrop() } else { model.beginCrop() }
             } label: {
                 Image(systemName: "crop").font(.system(size: 11))
                     .foregroundStyle(model.cropping ? t.selT : t.t2)
@@ -1591,7 +1602,8 @@ struct DevelopModule: View {
                     .clipShape(RoundedRectangle(cornerRadius: Radius.control))
             }
             .buttonStyle(.plain)
-            .help("Drag a rectangle over the picture to keep only that part.")
+            .help(
+                "Crop on the master. Drag a rectangle over the picture to keep only that part.")
 
             if let r = model.cropResolution {
                 Button("Crop to \(r.w) × \(r.h)") { model.confirmCrop() }
@@ -1629,18 +1641,23 @@ struct DevelopModule: View {
     private var canvas: some View {
         VStack(spacing: 0) {
             HStack(spacing: Space.md) {
-                Segmented(
-                    items: SplitMode.allCases.map(\.rawValue),
-                    index: Binding(
-                        get: { SplitMode.allCases.firstIndex(of: model.split) ?? 0 },
-                        set: { model.split = SplitMode.allCases[$0] }))
-                Text("B").font(Face.mono(10)).foregroundStyle(t.t3)
-                    .padding(.horizontal, 4).frame(height: 14)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: Radius.swatch)
-                            .stroke(t.line2, lineWidth: 0.5))
-                Text("hold to flip").font(Face.secondary).foregroundStyle(t.t4)
-                if model.separated {
+                if model.isMasterView {
+                    Text(model.separated ? "Merged · whole frame" : "Master · whole frame")
+                        .font(Face.mono(10)).foregroundStyle(t.t3)
+                } else {
+                    Segmented(
+                        items: SplitMode.allCases.map(\.rawValue),
+                        index: Binding(
+                            get: { SplitMode.allCases.firstIndex(of: model.split) ?? 0 },
+                            set: { model.split = SplitMode.allCases[$0] }))
+                    Text("B").font(Face.mono(10)).foregroundStyle(t.t3)
+                        .padding(.horizontal, 4).frame(height: 14)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: Radius.swatch)
+                                .stroke(t.line2, lineWidth: 0.5))
+                    Text("hold to flip").font(Face.secondary).foregroundStyle(t.t4)
+                }
+                if model.separated, !model.isMasterView {
                     Segmented(
                         items: DevelopModel.SplitLayout.allCases.map(\.rawValue),
                         index: Binding(
@@ -1958,7 +1975,7 @@ struct DevelopModule: View {
                 [model.viewport.flipH ? "H" : "", model.viewport.flipV ? "V" : ""]
                     .filter { !$0.isEmpty }.joined(separator: " + ").ifEmpty("no"))
             info("Crop", model.viewport.isCropped ? cropSummary : "full frame")
-            note("Rotation, flip and crop belong to the frame, so everything downstream — including both star layers — inherits them and stays in register.")
+            note("Rotation, flip and crop belong to the frame, so everything downstream — including both star layers — inherits them and stays in register. This is the only view that shows the whole frame with no comparison split, which is why it is the only place a crop can be drawn.")
 
             HStack(spacing: Space.sm) {
                 act("Reveal in Finder") {
@@ -2673,75 +2690,84 @@ struct DevelopCanvas: View {
             ZStack(alignment: .topLeading) {
                 tokens.img
 
-                if model.separated {
-                    separatedLayout
-                }
+                // The master is one picture and nothing else: no comparison
+                // split, no layer panes. That is what makes a drag here mean
+                // the crop marquee and only that.
+                if model.isMasterView {
+                    masterView
+                } else {
+                    if model.separated {
+                        separatedLayout
+                    }
 
-                if showAfter && !model.separated {
-                    MetalImageView(
-                        renderer: model.renderer,
-                        shadows: model.renderer.shadows,
-                        midtone: model.renderer.midtone,
-                        calOffset: model.renderer.calOffset,
-                        calGain: model.renderer.calGain,
-                        paletteR: model.renderer.paletteR,
-                        paletteG: model.renderer.paletteG,
-                        paletteB: model.renderer.paletteB,
-                        algorithm: model.algorithm.rawValue,
-                        p0: model.p0, p1: model.p1, blend: model.blend,
-                        saturation: model.saturation,
-                        zonesOn: model.renderer.zonesOn,
-                        tone: model.renderer.tone,
-                        detail: model.renderer.detail,
-                        ops: model.renderer.ops,
-                        zoneTable: model.zoneTable,
-                        viewport: model.viewport,
-                        onZoom: { model.pinch($0, at: $1, viewAspect: $2) },
-                        onPan: { model.drag($0, viewAspect: $1) },
-                        onReset: { model.resetView() })
-                }
+                    if showAfter && !model.separated {
+                        MetalImageView(
+                            renderer: model.renderer,
+                            shadows: model.renderer.shadows,
+                            midtone: model.renderer.midtone,
+                            calOffset: model.renderer.calOffset,
+                            calGain: model.renderer.calGain,
+                            paletteR: model.renderer.paletteR,
+                            paletteG: model.renderer.paletteG,
+                            paletteB: model.renderer.paletteB,
+                            algorithm: model.algorithm.rawValue,
+                            p0: model.p0, p1: model.p1, blend: model.blend,
+                            saturation: model.saturation,
+                            zonesOn: model.renderer.zonesOn,
+                            tone: model.renderer.tone,
+                            detail: model.renderer.detail,
+                            ops: model.renderer.ops,
+                            zoneTable: model.zoneTable,
+                            viewport: model.viewport,
+                            onZoom: { model.pinch($0, at: $1, viewAspect: $2) },
+                            onPan: { model.drag($0, viewAspect: $1) },
+                            onReset: { model.resetView() })
+                    }
 
-                // Guarded like the after pane: without this it draws over the
-                // layer split, masked to half the width, and the result looks
-                // like a before/after of something unrelated.
-                if showBefore && !model.separated {
-                    // Both halves share the viewport, or the split would compare
-                    // two different parts of the frame.
-                    MetalImageView(
-                        renderer: model.beforeRenderer,
-                        shadows: model.meta?.shadows ?? .zero,
-                        midtone: model.meta?.midtone ?? SIMD3(repeating: 0.25),
-                        algorithm: Algorithm.stf.rawValue,
-                        p0: 10, p1: 0.2, blend: 1, saturation: 1,
-                        viewport: model.viewport)
-                        .frame(width: geo.size.width, height: geo.size.height)
-                        .mask(alignment: .leading) {
-                            Rectangle().frame(
-                                width: model.split == .both && !model.holdingB
-                                    ? geo.size.width * divider : geo.size.width)
-                        }
-                        // A mask hides it but still lets it take events, and it
-                        // carries no handlers — so without this it silently
-                        // swallows every gesture meant for the pane below.
-                        .allowsHitTesting(false)
-                }
+                    // Guarded like the after pane: without this it draws over
+                    // the layer split, masked to half the width, and the result
+                    // looks like a before/after of something unrelated.
+                    if showBefore && !model.separated {
+                        // Both halves share the viewport, or the split would
+                        // compare two different parts of the frame.
+                        MetalImageView(
+                            renderer: model.beforeRenderer,
+                            shadows: model.meta?.shadows ?? .zero,
+                            midtone: model.meta?.midtone ?? SIMD3(repeating: 0.25),
+                            algorithm: Algorithm.stf.rawValue,
+                            p0: 10, p1: 0.2, blend: 1, saturation: 1,
+                            viewport: model.viewport)
+                            .frame(width: geo.size.width, height: geo.size.height)
+                            .mask(alignment: .leading) {
+                                Rectangle().frame(
+                                    width: model.split == .both && !model.holdingB
+                                        ? geo.size.width * divider : geo.size.width)
+                            }
+                            // A mask hides it but still lets it take events, and
+                            // it carries no handlers — so without this it
+                            // silently swallows every gesture meant for the pane
+                            // below.
+                            .allowsHitTesting(false)
+                    }
 
-                if model.split == .both && !model.holdingB && !model.separated {
-                    Rectangle().fill(tokens.line3).frame(width: 1)
-                        .offset(x: geo.size.width * divider)
-                }
+                    if model.split == .both && !model.holdingB && !model.separated {
+                        Rectangle().fill(tokens.line3).frame(width: 1)
+                            .offset(x: geo.size.width * divider)
+                    }
 
-                if !model.separated {
-                    Text("As stacked").font(Face.mono(10)).foregroundStyle(tokens.t2)
+                    if !model.separated {
+                        Text("As stacked").font(Face.mono(10)).foregroundStyle(tokens.t2)
+                            .padding(Space.md)
+                        Text(
+                            model.calibrationActive
+                                ? "\(model.algorithm.label) · calibrated" : model.algorithm.label
+                        )
+                        .font(Face.mono(10)).foregroundStyle(tokens.t2)
                         .padding(Space.md)
-                    Text(
-                        model.calibrationActive
-                            ? "\(model.algorithm.label) · calibrated" : model.algorithm.label
-                    )
-                    .font(Face.mono(10)).foregroundStyle(tokens.t2)
-                    .padding(Space.md)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                    }
                 }
+
                 if model.cropping || model.pendingCrop != nil {
                     cropOverlay(geo.size)
                 }
@@ -2752,6 +2778,9 @@ struct DevelopCanvas: View {
                     .onChanged { v in
                         guard geo.size.width > 0, geo.size.height > 0 else { return }
                         guard model.cropping else {
+                            // No divider to move on the master: it shows one
+                            // picture, so a drag there has nothing else to mean.
+                            guard !model.isMasterView else { return }
                             divider = min(0.98, max(0.02, v.location.x / geo.size.width))
                             return
                         }
@@ -2787,6 +2816,42 @@ struct DevelopCanvas: View {
             guard press.characters.lowercased() == "b" else { return .ignored }
             model.holdingB = press.phase == .down
             return .handled
+        }
+    }
+
+    /// The whole frame, on its own. When the frame has been split this is the
+    /// merge, because that is the only picture with the same geometry as the
+    /// crop being drawn on it.
+    @ViewBuilder
+    private var masterView: some View {
+        ZStack(alignment: .topLeading) {
+            if model.separated {
+                mergedView
+            } else {
+                MetalImageView(
+                    renderer: model.renderer,
+                    shadows: model.renderer.shadows,
+                    midtone: model.renderer.midtone,
+                    calOffset: model.renderer.calOffset,
+                    calGain: model.renderer.calGain,
+                    paletteR: model.renderer.paletteR,
+                    paletteG: model.renderer.paletteG,
+                    paletteB: model.renderer.paletteB,
+                    algorithm: model.algorithm.rawValue,
+                    p0: model.p0, p1: model.p1, blend: model.blend,
+                    saturation: model.saturation,
+                    zonesOn: model.renderer.zonesOn,
+                    tone: model.renderer.tone,
+                    detail: model.renderer.detail,
+                    ops: model.renderer.ops,
+                    zoneTable: model.zoneTable,
+                    viewport: model.viewport,
+                    onZoom: { model.pinch($0, at: $1, viewAspect: $2) },
+                    onPan: { model.drag($0, viewAspect: $1) },
+                    onReset: { model.resetView() })
+            }
+            Text(model.separated ? "Merged" : "Master")
+                .font(Face.mono(10)).foregroundStyle(tokens.t2).padding(Space.md)
         }
     }
 
