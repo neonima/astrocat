@@ -49,17 +49,23 @@ final class CanvasView: MTKView {
             Float(bounds.width / bounds.height))
     }
 
-    /// A single click has to be reported here rather than left to a SwiftUI
-    /// gesture on the enclosing view. Overriding `mouseDown` at all makes this
-    /// view swallow the event — an `onTapGesture` wrapped around a Metal view
-    /// never fires, which is why clicking a layer pane to select it did nothing
-    /// while the segmented control worked.
+    /// A single click is reported here rather than left to a SwiftUI gesture on
+    /// the enclosing view: overriding `mouseDown` at all makes this view swallow
+    /// the event, so an `onTapGesture` wrapped around a Metal view never fires.
+    /// That is why clicking a layer pane to select it did nothing while the
+    /// segmented control worked.
+    ///
+    /// The event is only passed on where something wants it. Panes that are not
+    /// selectable — the single-frame canvas — keep swallowing it, because the
+    /// crop marquee is a `DragGesture` on the view above and letting the click
+    /// travel up the responder chain interferes with it.
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 {
             onReset?()
-        } else {
-            onSelect?()
+            return
         }
+        guard let onSelect else { return }
+        onSelect()
         super.mouseDown(with: event)
     }
 }
@@ -109,7 +115,7 @@ struct MetalImageView: NSViewRepresentable {
         }
         view.onPan = { onPan?($0, $1) }
         view.onReset = { onReset?() }
-        view.onSelect = { onSelect?() }
+        view.onSelect = onSelect
         return view
     }
 
