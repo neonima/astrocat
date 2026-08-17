@@ -1,0 +1,11 @@
+[package]
+name = "astrocat-ffi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "astrocat_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+astrocat-core = { path = "../astrocat-core" }

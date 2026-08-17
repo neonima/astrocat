@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/astrocat-core", "crates/astrocat-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

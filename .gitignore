@@ -1,0 +1,23 @@
+# data
+samples/
+*.fit
+*.fits
+*.mp4
+
+# rust
+target/
+**/*.rs.bk
+
+# swift / xcode
+.build/
+DerivedData/
+*.xcuserstate
+*.xcodeproj/xcuserdata/
+
+# build output
+dist/
+*.metallib
+*.air
+
+# macos
+.DS_Store
