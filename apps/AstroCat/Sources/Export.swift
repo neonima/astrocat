@@ -1,5 +1,7 @@
 import AppKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 enum Exporter {
     /// Siril reads FITS bottom-up and wants the pedestal left in so it can find
@@ -8,17 +10,29 @@ enum Exporter {
         switch target {
         case .siril: return (true, true)
         case .pixinsight: return (true, false)
-        case .lightroom: return (false, false)
+        case .lightroom, .png, .jpeg: return (false, false)
         }
     }
 
-    static func suggestedName(_ target: ExportTarget, frames: Int, exposure: Float, filter: String)
-        -> String
-    {
-        let base = String(
-            format: "NGC7000_%dx%.0fs_%@", frames, exposure,
-            filter.isEmpty ? "LP" : filter)
-        return base + (target == .lightroom ? ".tif" : ".fit")
+    static func suggestedName(
+        _ target: ExportTarget, object: String = "", frames: Int, exposure: Float, filter: String
+    ) -> String {
+        // Named after what it is a picture of, which is the only part of the
+        // filename anyone reads later.
+        let target_ = object.replacingOccurrences(of: " ", with: "")
+        let stem = target_.isEmpty ? "Stack" : target_
+        let base =
+            frames > 0
+            ? String(
+                format: "%@_%dx%.0fs_%@", stem, frames, exposure,
+                filter.isEmpty ? "LP" : filter)
+            : "\(stem)_\(filter.isEmpty ? "LP" : filter)"
+        switch target {
+        case .lightroom: return base + ".tif"
+        case .png: return base + ".png"
+        case .jpeg: return base + ".jpg"
+        default: return base + ".fit"
+        }
     }
 
     @MainActor
@@ -40,6 +54,11 @@ enum Exporter {
         if target == .lightroom {
             return writeTIFF(
                 source: source, to: url, stretch: stretch, calibration: calibration)
+        }
+        if target.isFinishedImage {
+            // These go through `exportImage` on the model, which has the
+            // renderer. Reaching here means a caller took the wrong path.
+            return "\(target.rawValue) is exported from the develop view."
         }
 
         let c = conventions(target)
@@ -107,6 +126,132 @@ enum Exporter {
         } catch {
             return error.localizedDescription
         }
+    }
+
+    /// Writes what the renderer produced, with the frame's provenance in EXIF.
+    ///
+    /// The pixels come from the same shader that drew the screen, so this is the
+    /// picture you were looking at rather than a second implementation of the
+    /// pipeline. `pixels` is BGRA, top row first, straight out of the Metal
+    /// texture.
+    @MainActor
+    static func writeImage(
+        pixels: [UInt8], width: Int, height: Int, target: ExportTarget, meta: FrameMeta?,
+        to url: URL
+    ) -> String? {
+        guard width > 0, height > 0, pixels.count >= width * height * 4 else {
+            return "Nothing rendered to export"
+        }
+
+        // Metal gives BGRA; CoreGraphics is told so rather than the bytes being
+        // shuffled here.
+        var data = pixels
+        guard
+            let provider = CGDataProvider(
+                data: Data(bytes: &data, count: width * height * 4) as CFData),
+            let image = CGImage(
+                width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
+                    .union(.byteOrder32Little),
+                provider: provider, decode: nil, shouldInterpolate: false,
+                intent: .defaultIntent)
+        else { return "Could not build the image" }
+
+        let type = target == .png ? UTType.png : UTType.jpeg
+        guard
+            let dest = CGImageDestinationCreateWithURL(
+                url as CFURL, type.identifier as CFString, 1, nil)
+        else { return "Could not create \(url.lastPathComponent)" }
+
+        CGImageDestinationAddImage(dest, image, properties(meta, target) as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else {
+            return "Could not write \(url.lastPathComponent)"
+        }
+        return nil
+    }
+
+    /// What the picture is of and what took it.
+    ///
+    /// A FITS header carries all of this, and a PNG posted to a forum carries
+    /// none of it unless it is written here — so the target, the optics and the
+    /// integration go into EXIF where any viewer will show them. Fields the
+    /// header did not supply are left out rather than written as zero.
+    private static func properties(_ meta: FrameMeta?, _ target: ExportTarget) -> [CFString: Any] {
+        var tiff: [CFString: Any] = [kCGImagePropertyTIFFSoftware: "AstroCat"]
+        var exif: [CFString: Any] = [:]
+        var props: [CFString: Any] = [
+            kCGImagePropertyOrientation: 1
+        ]
+        if target == .jpeg { props[kCGImageDestinationLossyCompressionQuality] = 0.95 }
+
+        guard let m = meta else {
+            props[kCGImagePropertyTIFFDictionary] = tiff
+            return props
+        }
+
+        if !m.telescope.isEmpty {
+            tiff[kCGImagePropertyTIFFMake] = m.telescope
+            tiff[kCGImagePropertyTIFFModel] = m.telescope
+            exif[kCGImagePropertyExifLensModel] = m.telescope
+        }
+        // The subject, which is the one thing a viewer most wants back.
+        let subject = m.object.isEmpty ? "Deep sky" : m.object
+        tiff[kCGImagePropertyTIFFImageDescription] = describe(m, subject: subject)
+
+        if m.focalLen > 0 {
+            exif[kCGImagePropertyExifFocalLength] = m.focalLen
+            exif[kCGImagePropertyExifLensSpecification] = [m.focalLen, m.focalLen, 0, 0]
+        }
+        // Total integration, not the length of one sub — that is the exposure
+        // this picture actually represents.
+        let integration = m.totalExp > 0 ? m.totalExp : m.exposure
+        if integration > 0 { exif[kCGImagePropertyExifExposureTime] = integration }
+        if m.gain > 0 { exif[kCGImagePropertyExifISOSpeedRatings] = [Int(m.gain)] }
+        if !m.dateObs.isEmpty {
+            // FITS writes ISO 8601; EXIF wants colons in the date.
+            let stamp = m.dateObs.replacingOccurrences(of: "T", with: " ")
+            let exifDate = stamp.prefix(10).replacingOccurrences(of: "-", with: ":")
+                + stamp.dropFirst(10).prefix(9)
+            exif[kCGImagePropertyExifDateTimeOriginal] = String(exifDate)
+            tiff[kCGImagePropertyTIFFDateTime] = String(exifDate)
+        }
+        exif[kCGImagePropertyExifUserComment] = describe(m, subject: subject)
+
+        props[kCGImagePropertyTIFFDictionary] = tiff
+        props[kCGImagePropertyExifDictionary] = exif
+        if let gps = location(m) { props[kCGImagePropertyGPSDictionary] = gps }
+        return props
+    }
+
+    /// One line a human can read in any image viewer.
+    private static func describe(_ m: FrameMeta, subject: String) -> String {
+        var parts = [subject]
+        if m.stackCount > 0 {
+            parts.append(
+                m.exposure > 0
+                    ? String(format: "%d × %.0fs", m.stackCount, m.exposure)
+                    : "\(m.stackCount) frames")
+        }
+        if m.totalExp > 0 {
+            parts.append(String(format: "%.1f h integration", m.totalExp / 3600))
+        }
+        if !m.filter.isEmpty { parts.append(m.filter) }
+        if !m.telescope.isEmpty { parts.append(m.telescope) }
+        if m.focalLen > 0 { parts.append(String(format: "%.0f mm", m.focalLen)) }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Where it was shot, when the header says. Absent rather than (0, 0),
+    /// which is a real place in the Gulf of Guinea.
+    private static func location(_ m: FrameMeta) -> [CFString: Any]? {
+        guard m.siteLat != 0 || m.siteLong != 0 else { return nil }
+        return [
+            kCGImagePropertyGPSLatitude: abs(Double(m.siteLat)),
+            kCGImagePropertyGPSLatitudeRef: m.siteLat >= 0 ? "N" : "S",
+            kCGImagePropertyGPSLongitude: abs(Double(m.siteLong)),
+            kCGImagePropertyGPSLongitudeRef: m.siteLong >= 0 ? "E" : "W",
+        ]
     }
 
     static func mtfPublic(_ m: Float, _ x: Float) -> Float { mtf(m, x) }

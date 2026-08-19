@@ -218,13 +218,59 @@ final class Renderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
-        guard let tex = texture,
-            let pass = view.currentRenderPassDescriptor,
-            let drawable = view.currentDrawable,
-            let buffer = queue.makeCommandBuffer()
+        guard let pass = view.currentRenderPassDescriptor,
+            let drawable = view.currentDrawable
         else { return }
+        encode(pass, size: view.drawableSize, present: drawable)
+    }
 
-        let m = viewMatrix(view.drawableSize)
+    /// Renders into a texture instead of a drawable and hands back the pixels.
+    ///
+    /// Export goes through the same shader the screen does, so what is written
+    /// is what was on screen rather than a second implementation of the pipeline
+    /// that has to be kept in step with it.
+    ///
+    /// `viewport` and the stage parameters are whatever the caller has already
+    /// set; only the size differs.
+    func render(width: Int, height: Int) -> [UInt8]? {
+        guard width > 0, height > 0 else { return nil }
+        let d = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+        d.usage = [.renderTarget, .shaderRead]
+        d.storageMode = .shared
+        guard let target = device.makeTexture(descriptor: d) else { return nil }
+
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+
+        guard encode(pass, size: CGSize(width: width, height: height), waitForCompletion: true)
+        else { return nil }
+
+        var out = [UInt8](repeating: 0, count: width * height * 4)
+        out.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            target.getBytes(
+                base, bytesPerRow: width * 4,
+                from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        }
+        return out
+    }
+
+    /// The one encode path. `draw(in:)` presents a drawable and `render` reads
+    /// the texture back, but both run the same passes with the same uniforms —
+    /// which is what makes "the export matches the screen" a fact rather than
+    /// an intention.
+    @discardableResult
+    private func encode(
+        _ pass: MTLRenderPassDescriptor, size: CGSize,
+        present drawable: (any MTLDrawable)? = nil, waitForCompletion: Bool = false
+    ) -> Bool {
+        guard let tex = texture, let buffer = queue.makeCommandBuffer() else { return false }
+
+        let m = viewMatrix(size)
         var u = Uniforms(
             viewX: m.0, viewY: m.1, viewC: m.2, shadows: shadows, midtone: midtone,
             calOffset: calOffset, calGain: calGain,
@@ -237,19 +283,28 @@ final class Renderer: NSObject, MTKViewDelegate {
             clarity: detail.clarity, texture: detail.texture, opCount: Int32(ops.count),
             maskOutside: 1, crop: viewport.crop)
 
-        let width = Int(view.drawableSize.width)
-        let height = Int(view.drawableSize.height)
+        let width = Int(size.width)
+        let height = Int(size.height)
         let wantsDetail =
             !detail.isIdentity && offscreen != nil && composite != nil
             && ensureTargets(width, height)
 
-        // Straight to the drawable when nothing needs a neighbourhood, which is
+        func finish() -> Bool {
+            if let drawable { buffer.present(drawable) }
+            buffer.commit()
+            if waitForCompletion { buffer.waitUntilCompleted() }
+            return true
+        }
+
+        // Straight to the target when nothing needs a neighbourhood, which is
         // most of the time and half the work.
         guard wantsDetail,
             let scene = sceneTex, let coarse = coarseTex, let fine = fineTex,
             let offPipeline = offscreen, let compPipeline = composite
         else {
-            guard let encoder = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
+            guard let encoder = buffer.makeRenderCommandEncoder(descriptor: pass) else {
+                return false
+            }
             encoder.setRenderPipelineState(pipeline)
             encoder.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
             encoder.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -260,9 +315,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             encoder.setFragmentTexture(tex, index: 0)
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             encoder.endEncoding()
-            buffer.present(drawable)
-            buffer.commit()
-            return
+            return finish()
         }
 
         let offDesc = MTLRenderPassDescriptor()
@@ -277,7 +330,9 @@ final class Renderer: NSObject, MTKViewDelegate {
         var offUniforms = u
         offUniforms.maskOutside = 0
 
-        guard let offEncoder = buffer.makeRenderCommandEncoder(descriptor: offDesc) else { return }
+        guard let offEncoder = buffer.makeRenderCommandEncoder(descriptor: offDesc) else {
+            return false
+        }
         offEncoder.setRenderPipelineState(offPipeline)
         offEncoder.setVertexBytes(&offUniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
         offEncoder.setFragmentBytes(&offUniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -301,7 +356,9 @@ final class Renderer: NSObject, MTKViewDelegate {
         coarseBlur?.encode(commandBuffer: buffer, sourceTexture: scene, destinationTexture: coarse)
         fineBlur?.encode(commandBuffer: buffer, sourceTexture: scene, destinationTexture: fine)
 
-        guard let compEncoder = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
+        guard let compEncoder = buffer.makeRenderCommandEncoder(descriptor: pass) else {
+            return false
+        }
         compEncoder.setRenderPipelineState(compPipeline)
         compEncoder.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
         compEncoder.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -311,7 +368,6 @@ final class Renderer: NSObject, MTKViewDelegate {
         compEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         compEncoder.endEncoding()
 
-        buffer.present(drawable)
-        buffer.commit()
+        return finish()
     }
 }

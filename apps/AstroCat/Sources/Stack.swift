@@ -9,21 +9,43 @@ enum ExportTarget: String, CaseIterable {
     case siril = "Siril"
     case pixinsight = "PixInsight"
     case lightroom = "Photoshop / Lightroom"
+    case png = "PNG"
+    case jpeg = "JPEG"
+
+    /// Whether the target is a finished picture rather than something another
+    /// tool will keep processing. Finished pictures get the stretch baked in
+    /// and the provenance written into EXIF, because nothing downstream will
+    /// have the FITS header to read it from.
+    var isFinishedImage: Bool { self == .png || self == .jpeg }
 
     var settings: String {
         switch self {
         case .siril: return "32-bit float FITS, linear, gradient left in"
         case .pixinsight: return "32-bit float FITS, linear, no normalisation"
         case .lightroom: return "16-bit TIFF, stretched, sRGB"
+        case .png: return "8-bit PNG, as displayed, cropped, with EXIF"
+        case .jpeg: return "8-bit JPEG at 95%, as displayed, cropped, with EXIF"
         }
     }
 
-    var format: String { self == .lightroom ? "TIFF, 16-bit" : "FITS, BITPIX −32" }
+    var format: String {
+        switch self {
+        case .lightroom: return "TIFF, 16-bit"
+        case .png: return "PNG, 8-bit"
+        case .jpeg: return "JPEG, 8-bit"
+        default: return "FITS, BITPIX −32"
+        }
+    }
 
     var rowOrder: String { self == .siril ? "bottom-up" : "top-down" }
 
+
     var data: String {
-        self == .lightroom ? "stretch baked in, sRGB" : "linear, stretch not applied"
+        switch self {
+        case .lightroom: return "stretch baked in, sRGB"
+        case .png, .jpeg: return "every stage baked in, sRGB"
+        default: return "linear, stretch not applied"
+        }
     }
 
     /// An AstroCat master carries no BIAS card — the pedestal is subtracted
@@ -39,6 +61,8 @@ enum ExportTarget: String, CaseIterable {
         case .siril: return "Siril runs its own background extraction; leaving ours in fights it."
         case .pixinsight: return "PixInsight normalises during integration and prefers raw linear input."
         case .lightroom: return "Neither reads FITS or linear data, so the stretch has to be baked in."
+        case .png: return "Lossless and universally readable — the one to post or print from."
+        case .jpeg: return "Smaller, lossy. Fine for sharing, not for anything you will edit again."
         }
     }
 }

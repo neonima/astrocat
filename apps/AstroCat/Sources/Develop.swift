@@ -1433,6 +1433,82 @@ final class DevelopModel: ObservableObject {
         r.midtone = midtone
     }
 
+    /// The finished picture, at the master's own resolution, through the same
+    /// shader that drew the screen.
+    ///
+    /// Rendered at the crop's exact pixel size with zoom and pan neutralised, so
+    /// what lands in the file is the crop rather than wherever you happened to
+    /// be looking, and there is no letterbox to trim.
+    /// What an exported picture would be, in pixels: the crop at the master's
+    /// own resolution, turned the way the frame is.
+    var exportSize: (w: Int, h: Int)? {
+        guard let m = master.meta else { return nil }
+        let full = SIMD2(
+            Float(max(m.srcWidth, m.width)), Float(max(m.srcHeight, m.height)))
+        let size = viewport.cropSize
+        let w = Int((size.x * full.x).rounded())
+        let h = Int((size.y * full.y).rounded())
+        // A quarter turn swaps which side is which.
+        return viewport.quarterTurns % 2 == 1 ? (h, w) : (w, h)
+    }
+
+    func exportImage(_ target: ExportTarget) {
+        guard let m = master.meta, !master.path.isEmpty, let out = exportSize else {
+            exportError = "Nothing to export yet — stack or open a master first."
+            return
+        }
+        let width = out.w
+        let height = out.h
+        guard width > 31, height > 31 else {
+            exportError = "The crop is too small to export."
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = Exporter.suggestedName(
+            target, object: m.object, frames: m.stackCount, exposure: m.exposure,
+            filter: m.filter)
+        panel.canCreateDirectories = true
+        panel.message = "\(target.rawValue) — \(width) × \(height), \(target.settings)"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        guard var pixels = renderLayer(active, width: width, height: height) else {
+            exportError = "Could not render the picture."
+            return
+        }
+        // Separated, the picture is the merge — the star layer is unscreened, so
+        // a screen blend is exactly its inverse, and it is the same formula
+        // SwiftUI composites the panes with.
+        if separated, let a = starless, let b = stars,
+            let under = renderLayer(a, width: width, height: height),
+            let over = renderLayer(b, width: width, height: height)
+        {
+            pixels = under
+            for i in 0..<min(pixels.count, over.count) where i % 4 != 3 {
+                let x = Float(under[i]) / 255
+                let y = Float(over[i]) / 255
+                pixels[i] = UInt8(max(0, min(1, 1 - (1 - x) * (1 - y))) * 255)
+            }
+        }
+
+        exportError = Exporter.writeImage(
+            pixels: pixels, width: width, height: height, target: target, meta: m, to: url)
+        if exportError == nil { savedAt = Date() }
+    }
+
+    /// Renders one layer at an exact size with the view neutralised, then puts
+    /// the viewport back — the on-screen zoom is not an edit and must survive
+    /// an export.
+    private func renderLayer(_ s: LayerState, width: Int, height: Int) -> [UInt8]? {
+        let saved = s.renderer.viewport
+        var v = viewport
+        v.zoom = 1
+        v.pan = .zero
+        s.renderer.viewport = v
+        defer { s.renderer.viewport = saved }
+        return s.renderer.render(width: width, height: height)
+    }
+
     func revert() {
         let s = active
         edit {
@@ -2048,9 +2124,15 @@ struct DevelopModule: View {
             }
             .padding(.top, Space.xl)
 
+            if model.exportTarget.isFinishedImage, let out = model.exportSize {
+                info("Resolution", "\(out.w) × \(out.h) px")
+                info("Print", PrintSize.describe(px: (out.w, out.h)))
+                info("Metadata", "target, optics and integration in EXIF")
+                note("Rendered through the same shader that drew the screen, at the master's own resolution and cropped as you set it — so the file is the picture you were looking at, not a second version of it. When the frame is separated it exports the merge.")
+            }
             info(
                 "Stretch",
-                model.exportTarget == .lightroom
+                model.exportTarget.isFinishedImage || model.exportTarget == .lightroom
                     ? "baked in" : "not applied — data stays linear")
             info(
                 "Colour calibration",
@@ -2061,12 +2143,20 @@ struct DevelopModule: View {
 
             HStack(spacing: Space.sm) {
                 act("Export…", primary: true) {
+                    // A finished picture is rendered, not converted: it needs
+                    // the shader and the crop, which only the model has.
+                    if model.exportTarget.isFinishedImage {
+                        model.exportImage(model.exportTarget)
+                        return
+                    }
                     model.exportError = Exporter.run(
                         source: model.source,
                         target: model.exportTarget,
                         suggested: Exporter.suggestedName(
-                            model.exportTarget, frames: 0,
-                            exposure: model.meta?.exposure ?? 60, filter: "LP"),
+                            model.exportTarget, object: model.meta?.object ?? "",
+                            frames: model.meta?.stackCount ?? 0,
+                            exposure: model.meta?.exposure ?? 60,
+                            filter: model.meta?.filter ?? ""),
                         stretch: (model.renderer.shadows, model.renderer.midtone),
                         calibration: model.calibrationActive
                             ? (model.renderer.calOffset, model.renderer.calGain) : nil)

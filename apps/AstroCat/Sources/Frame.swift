@@ -25,6 +25,11 @@ struct FrameMeta {
     var bayer = ""
     var telescope = ""
     var filter = ""
+    /// Provenance for exported images. Zero means the header did not say.
+    var focalLen: Float = 0
+    var pixelSize: Float = 0
+    var totalExp: Float = 0
+    var stackCount = 0
 }
 
 final class LoadedFrame {
@@ -75,6 +80,10 @@ final class LoadedFrame {
         m.bayer = String(cString: ac_buf_bayer(handle))
         m.telescope = String(cString: ac_buf_telescope(handle))
         m.filter = String(cString: ac_buf_filter(handle))
+        m.focalLen = info.focal_len
+        m.pixelSize = info.pixel_size
+        m.totalExp = info.total_exp
+        m.stackCount = Int(info.stack_count)
         self.meta = m
     }
 

@@ -29,6 +29,10 @@ typedef struct {
   float site_lat;
   float site_long;
   float full_scale;
+  float focal_len;
+  float pixel_size;
+  float total_exp;
+  uint32_t stack_count;
 } AcInfo;
 
 const char *ac_last_error(void);

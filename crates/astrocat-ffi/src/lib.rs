@@ -38,6 +38,13 @@ pub struct AcInfo {
     pub site_long: f32,
     /// The normalisation used, so a derived frame can be put on the same scale.
     pub full_scale: f32,
+    /// Provenance, for the metadata an exported image carries. Zero when the
+    /// header does not say — an exported JPEG should omit a field rather than
+    /// claim a focal length of nothing.
+    pub focal_len: f32,
+    pub pixel_size: f32,
+    pub total_exp: f32,
+    pub stack_count: u32,
 }
 
 impl Default for AcInfo {
@@ -64,6 +71,10 @@ impl Default for AcInfo {
             site_lat: 0.0,
             site_long: 0.0,
             full_scale: 0.0,
+            focal_len: 0.0,
+            pixel_size: 0.0,
+            total_exp: 0.0,
+            stack_count: 0,
         }
     }
 }
@@ -175,6 +186,10 @@ pub unsafe extern "C" fn ac_load_fits_scaled(
         site_lat: img.header.float("SITELAT").unwrap_or(0.0) as f32,
         site_long: img.header.float("SITELONG").unwrap_or(0.0) as f32,
         full_scale,
+        focal_len: img.header.float("FOCALLEN").unwrap_or(0.0) as f32,
+        pixel_size: img.header.float("XPIXSZ").unwrap_or(0.0) as f32,
+        total_exp: img.header.float("TOTALEXP").unwrap_or(0.0) as f32,
+        stack_count: img.header.int("STACKCNT").unwrap_or(0) as u32,
     };
 
     Box::into_raw(Box::new(AcBuf {
