@@ -1,16 +1,23 @@
 import AppKit
 import SwiftUI
 
-enum RejectionAlgorithm: Int {
+enum RejectionAlgorithm: Int, Codable {
     case none = 0, sigmaClip = 1, winsorised = 2
 }
 
-enum ExportTarget: String, CaseIterable {
-    case siril = "Siril"
-    case pixinsight = "PixInsight"
-    case lightroom = "Photoshop / Lightroom"
-    case png = "PNG"
-    case jpeg = "JPEG"
+enum ExportTarget: String, CaseIterable, Codable {
+    case siril, pixinsight, lightroom, png, jpeg
+
+    /// Stored as the case name, shown as this. See `WhiteReference`.
+    var label: String {
+        switch self {
+        case .siril: return "Siril"
+        case .pixinsight: return "PixInsight"
+        case .lightroom: return "Photoshop / Lightroom"
+        case .png: return "PNG"
+        case .jpeg: return "JPEG"
+        }
+    }
 
     /// Whether the target is a finished picture rather than something another
     /// tool will keep processing. Finished pictures get the stretch baked in
@@ -67,15 +74,54 @@ enum ExportTarget: String, CaseIterable {
     }
 }
 
+/// How the stack is set up, as opposed to what it measured. One struct rather
+/// than a dozen properties so that persisting it is one decision: a control
+/// added here is saved because it is here, not because someone remembered to
+/// add it to a list somewhere else.
+///
+/// Derived values are absent by construction. `fullResolution` and `drizzle`
+/// are decided by the strategist or by `choice` at the moment a stack starts,
+/// and `subExptime` comes from the catalogue — storing any of them would let a
+/// stale file argue with the frames actually going in.
+struct StackSettings: Equatable {
+    var sigmaLow: Float = 3
+    var sigmaHigh: Float = 3
+    var rejection: RejectionAlgorithm = .sigmaClip
+    var passes = 1
+    var removeGradient = true
+    var keptOnly = true
+    var sixtyOnly = false
+    var worstCut: Float = 0
+    var overrideStrategy = false
+    var choice: StrategyChoice = .full
+    var target: ExportTarget = .siril
+    /// The session selection, by observing night rather than by session id.
+    /// Ids are positions in the catalogue and move when it is re-ingested, so
+    /// storing them would silently stack the wrong nights.
+    var nights: [String] = []
+}
+
+extension StackSettings: Migratable {
+    static let version = 1
+
+    static func url(_ project: String) -> URL {
+        URL(fileURLWithPath: project)
+            .appendingPathComponent(".astrocat", isDirectory: true)
+            .appendingPathComponent("stack.json")
+    }
+}
+
 @MainActor
 final class StackModel: ObservableObject {
-    @Published var sigmaLow: Float = 3
-    @Published var sigmaHigh: Float = 3
-    @Published var removeGradient = true
-    @Published var keptOnly = true
-    @Published var sixtyOnly = false
-    @Published var sessionsUsed: Set<Int> = []
-    @Published var target: ExportTarget = .siril
+    @Published var settings = StackSettings() {
+        didSet {
+            guard settings != oldValue else { return }
+            scheduleSave()
+        }
+    }
+    @Published var sessionsUsed: Set<Int> = [] {
+        didSet { rememberSessions() }
+    }
     @Published var job = AcJob()
     @Published var message = ""
     @Published var subNoise: Float = 0
@@ -83,25 +129,30 @@ final class StackModel: ObservableObject {
     @Published var seestarFrames = 0
     @Published var seestarStars = 0
     @Published var subStars = 0
-    @Published var worstCut: Float = 0
-    @Published var rejection: RejectionAlgorithm = .sigmaClip
     @Published var viewMode = 0
     var filename: String { "NGC7000_\(job.frames_used)x60s_LP.fit" }
-    @Published var passes = 1
+    /// Decided at the moment a stack starts, by the strategist or by
+    /// `settings.choice`. Not settings, so not saved.
     @Published var fullResolution = true
-    @Published var overrideStrategy = false
-    @Published var choice: StrategyChoice = .full
     @Published var drizzle = false
     @Published var referenceName = "auto (most stars)"
 
     @Published var subExptime: Float = 60
     @Published var outputPath = ""
     /// Where masters are written. Empty means the project is not open yet, and
-    /// stacking falls back to a temp file rather than refusing.
-    @Published var projectRoot = ""
+    /// stacking falls back to a temp file rather than refusing. Setting it is
+    /// also what brings that project's own stack settings in.
+    @Published var projectRoot = "" {
+        didSet {
+            guard projectRoot != oldValue else { return }
+            loadSettings()
+        }
+    }
     @Published var exportError: String?
 
     private var timer: Timer?
+    private var saveTimer: Timer?
+    private var restoring = false
     private var seeded = false
 
     let beforeRenderer = Renderer()
@@ -133,15 +184,74 @@ final class StackModel: ObservableObject {
         hasAfter = true
     }
 
+    /// Settings belong to the project, not to the app — two projects are two
+    /// different sets of frames and rarely want the same rejection.
+    private func loadSettings() {
+        guard !projectRoot.isEmpty,
+            let data = try? Data(contentsOf: StackSettings.url(projectRoot)),
+            let saved = Settings.decode(StackSettings.self, from: data)
+        else { return }
+        restoring = true
+        settings = saved
+        // The nights are resolved against the catalogue, which may not be open
+        // yet; syncSessions does that when it is.
+        seeded = false
+        restoring = false
+    }
+
+    /// Written on a delay, so dragging the cut slider does not write a file per
+    /// frame, and only when the settings differ — the job poll republishes the
+    /// model five times a second while a stack runs.
+    private func scheduleSave() {
+        guard !restoring, !projectRoot.isEmpty else { return }
+        let snapshot = settings
+        let root = projectRoot
+        saveTimer?.invalidate()
+        saveTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { _ in
+            Task { @MainActor in
+                let url = StackSettings.url(root)
+                try? FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                guard let data = Settings.encode(snapshot, carrying: try? Data(contentsOf: url))
+                else { return }
+                try? data.write(to: url, options: .atomic)
+            }
+        }
+    }
+
     /// Seeds the selection once, then leaves it under the user's control.
+    ///
+    /// A restored selection is by night, so it is resolved here rather than at
+    /// load: the catalogue is what turns a night into a session id, and it is
+    /// not necessarily open yet when the project path is set.
     func syncSessions(_ catalog: Catalog) {
+        catalogNights = catalog.sessions.reduce(into: [:]) { $0[$1.id] = $1.night }
         let known = Set(catalog.sessions.map(\.id))
-        if sessionsUsed.isEmpty && !seeded {
-            sessionsUsed = known
+        if !seeded {
+            let wanted = Set(settings.nights)
+            let restored = Set(catalog.sessions.filter { wanted.contains($0.night) }.map(\.id))
+            // Nothing restored means either no saved selection or a catalogue
+            // that no longer holds those nights. Either way the useful default
+            // is everything, not nothing.
+            sessionsUsed = restored.isEmpty ? known : restored
             seeded = true
         } else {
             sessionsUsed.formIntersection(known)
         }
+    }
+
+    /// Session ids mean nothing outside the catalogue that issued them, so the
+    /// selection is written down as the nights they name.
+    private var catalogNights: [Int: String] = [:]
+
+    private func rememberSessions() {
+        guard !catalogNights.isEmpty else { return }
+        // Empty means all, which is also what an unrecorded selection restores
+        // to — so a night shot later is included rather than left out of a list
+        // written before it existed.
+        settings.nights =
+            sessionsUsed == Set(catalogNights.keys)
+            ? [] : sessionsUsed.compactMap { catalogNights[$0] }.sorted()
     }
 
     /// A stack costs minutes, so it lands in the project under a name that says
@@ -168,8 +278,8 @@ final class StackModel: ObservableObject {
     func inputs(_ catalog: Catalog) -> [Frame] {
         catalog.frames.filter { f in
             guard sessionsUsed.contains(f.session) else { return false }
-            if keptOnly && f.rejected { return false }
-            if sixtyOnly && abs(f.exptime - 60) > 0.5 { return false }
+            if settings.keptOnly && f.rejected { return false }
+            if settings.sixtyOnly && abs(f.exptime - 60) > 0.5 { return false }
             return true
         }
     }
@@ -177,9 +287,9 @@ final class StackModel: ObservableObject {
     func start(_ frames: [Frame]) {
         guard !frames.isEmpty else { return }
         // The measurement decides unless the user has taken the wheel.
-        if overrideStrategy {
-            fullResolution = choice != .binned
-            drizzle = choice == .drizzle
+        if settings.overrideStrategy {
+            fullResolution = settings.choice != .binned
+            drizzle = settings.choice == .drizzle
         } else if let s = Strategist.recommend(
             frames: frames, measuredDrift: job.state == 2 ? job.drift_px : nil)
         {
@@ -193,7 +303,7 @@ final class StackModel: ObservableObject {
         let ok = list.withCString { l in
             out.withCString { o in
                 ac_stack_start(
-                    l, o, sigmaLow, sigmaHigh, removeGradient ? 1 : 0,
+                    l, o, settings.sigmaLow, settings.sigmaHigh, settings.removeGradient ? 1 : 0,
                     fullResolution ? 1 : 0, drizzle ? 2 : 0)
             }
         }
@@ -267,9 +377,9 @@ struct StackModule: View {
     /// How many frames this night actually contributes under the live filters.
     private func usedCount(_ s: SessionInfo) -> Int {
         catalog.frames[s.first..<(s.first + s.count)].filter { f in
-            if model.keptOnly && f.rejected { return false }
-            if model.sixtyOnly && abs(f.exptime - 60) > 0.5 { return false }
-            if f.quality < model.worstCut { return false }
+            if model.settings.keptOnly && f.rejected { return false }
+            if model.settings.sixtyOnly && abs(f.exptime - 60) > 0.5 { return false }
+            if f.quality < model.settings.worstCut { return false }
             return true
         }.count
     }
@@ -356,13 +466,13 @@ struct StackModule: View {
         VStack(alignment: .leading, spacing: 0) {
             header("Filters").padding(.top, Space.xl)
             HStack(spacing: Space.sm) {
-                chip("Kept only", $model.keptOnly)
-                chip("60 s only", $model.sixtyOnly)
+                chip("Kept only", $model.settings.keptOnly)
+                chip("60 s only", $model.settings.sixtyOnly)
             }
             HStack(spacing: Space.sm) {
                 Text("Worst").font(Face.secondary).foregroundStyle(t.t3)
-                Slider(value: $model.worstCut, in: 0...0.5).controlSize(.small)
-                Text(String(format: "%.0f%% cut", model.worstCut * 100))
+                Slider(value: $model.settings.worstCut, in: 0...0.5).controlSize(.small)
+                Text(String(format: "%.0f%% cut", model.settings.worstCut * 100))
                     .font(Face.mono(11)).foregroundStyle(t.t2).frame(width: 60)
             }
             .padding(.top, Space.xs)
@@ -514,7 +624,7 @@ struct StackModule: View {
                 "Stack",
                 j.state == 2
                     ? String(format: "%.2f%% of samples clipped", j.clipped_pct)
-                    : "σ-clip \(String(format: "%.1f", model.sigmaLow)) / \(String(format: "%.1f", model.sigmaHigh))",
+                    : "σ-clip \(String(format: "%.1f", model.settings.sigmaLow)) / \(String(format: "%.1f", model.settings.sigmaHigh))",
                 2, j, j.combine_s)
 
             if j.state == 1 {
@@ -544,8 +654,8 @@ struct StackModule: View {
     /// What the next run will actually do — the recommendation unless the user
     /// has overridden it. Showing the last run's settings would be a lie.
     private var planned: (drizzle: Int, fullResolution: Bool) {
-        if model.overrideStrategy {
-            return (model.choice == .drizzle ? 2 : 0, model.choice != .binned)
+        if model.settings.overrideStrategy {
+            return (model.settings.choice == .drizzle ? 2 : 0, model.settings.choice != .binned)
         }
         guard
             let s = Strategist.recommend(
@@ -660,11 +770,11 @@ struct StackModule: View {
                 Segmented(
                     items: ["None", "σ-clip", "Winsorised"],
                     index: Binding(
-                        get: { model.rejection.rawValue },
-                        set: { model.rejection = RejectionAlgorithm(rawValue: $0) ?? .sigmaClip }))
-                stepper("Low σ", $model.sigmaLow)
-                stepper("High σ", $model.sigmaHigh)
-                intStepper("Passes", $model.passes)
+                        get: { model.settings.rejection.rawValue },
+                        set: { model.settings.rejection = RejectionAlgorithm(rawValue: $0) ?? .sigmaClip }))
+                stepper("Low σ", $model.settings.sigmaLow)
+                stepper("High σ", $model.settings.sigmaHigh)
+                intStepper("Passes", $model.settings.passes)
 
                 header("Registration").padding(.top, Space.xl)
                 info("Method", solved == frames.count && frames.count > 0 ? "WCS" : "Star-based")
@@ -706,19 +816,19 @@ struct StackModule: View {
                         }
                         .padding(.top, 2)
                     }
-                    Toggle("Choose it myself", isOn: $model.overrideStrategy)
+                    Toggle("Choose it myself", isOn: $model.settings.overrideStrategy)
                         .toggleStyle(.checkbox)
                         .font(Face.secondary)
                         .foregroundStyle(t.t2)
                         .padding(.top, Space.sm)
 
-                    if model.overrideStrategy {
+                    if model.settings.overrideStrategy {
                         ForEach(StrategyChoice.allCases, id: \.rawValue) { c in
-                            let on = model.choice == c
-                            Button { model.choice = c } label: {
+                            let on = model.settings.choice == c
+                            Button { model.settings.choice = c } label: {
                                 VStack(alignment: .leading, spacing: 1) {
                                     HStack {
-                                        Text(c.rawValue).font(Face.body)
+                                        Text(c.label).font(Face.body)
                                             .foregroundStyle(on ? t.selT : t.t1)
                                         Spacer()
                                         if c.matches(s) {
@@ -739,7 +849,7 @@ struct StackModule: View {
                             .padding(.top, Space.xs)
                         }
 
-                        if !model.choice.matches(s) {
+                        if !model.settings.choice.matches(s) {
                             Text("Not what the data suggests — worth stacking both ways and comparing star count and noise in the table below.")
                                 .font(Face.secondary).foregroundStyle(t.q3)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -753,20 +863,20 @@ struct StackModule: View {
                 info("Provenance", "HISTORY cards")
 
                 header("Export for").padding(.top, Space.xl)
-                Picker("", selection: $model.target) {
+                Picker("", selection: $model.settings.target) {
                     ForEach(ExportTarget.allCases, id: \.rawValue) { e in
-                        Text(e.rawValue).tag(e)
+                        Text(e.label).tag(e)
                     }
                 }
                 .labelsHidden().font(Face.body)
 
-                info("Format", model.target.format)
-                info("Row order", model.target.rowOrder)
-                info("Data", model.target.data)
-                info("Pedestal", model.target.pedestal)
+                info("Format", model.settings.target.format)
+                info("Row order", model.settings.target.rowOrder)
+                info("Data", model.settings.target.data)
+                info("Pedestal", model.settings.target.pedestal)
                 info("Bayer", "none — already debayered")
                 info("Filename", model.filename)
-                note(model.target.reason)
+                note(model.settings.target.reason)
 
                 HStack(spacing: Space.sm) {
                     action("Export…") { export() }
@@ -791,9 +901,9 @@ struct StackModule: View {
     private func export() {
         model.exportError = Exporter.run(
             source: model.outputPath,
-            target: model.target,
+            target: model.settings.target,
             suggested: Exporter.suggestedName(
-                model.target, frames: Int(model.job.frames_used),
+                model.settings.target, frames: Int(model.job.frames_used),
                 exposure: model.subExptime, filter: catalog.sessions.first.map { _ in "LP" } ?? "LP"),
             stretch: (model.afterStretch.shadows, model.afterStretch.midtone))
     }

@@ -1,9 +1,17 @@
 import Foundation
 
-enum StrategyChoice: String, CaseIterable {
-    case full = "Full resolution"
-    case drizzle = "Drizzle 2×"
-    case binned = "Binned 2×2"
+/// The raw values are stable identifiers, not labels — a stack settings file
+/// stores one. See `WhiteReference`.
+enum StrategyChoice: String, CaseIterable, Codable {
+    case full, drizzle, binned
+
+    var label: String {
+        switch self {
+        case .full: return "Full resolution"
+        case .drizzle: return "Drizzle 2×"
+        case .binned: return "Binned 2×2"
+        }
+    }
 
     /// What it does to the output, in terms you can check afterwards.
     var effect: String {

@@ -145,22 +145,57 @@ struct DevelopSettings: Codable, Equatable {
     /// Zoom and pan are deliberately absent — where you were looking last time
     /// is not an edit. A crop is.
     var crop = SIMD4<Float>(0, 0, 1, 1)
-    /// Optional so a file written before they existed still decodes. A
-    /// non-optional field with a default does not fall back when the key is
-    /// missing — it throws, and the whole file is discarded as unreadable.
-    var stretchOn: Bool?
-    var separationOn: Bool?
+    /// A file written before the stretch could be switched off was written by a
+    /// build where it was always on, so its default is not the same as the
+    /// separation's.
+    var stretchOn = true
+    var separationOn = false
 
     static func load(_ master: String) -> DevelopSettings? {
         guard !master.isEmpty,
             let data = try? Data(contentsOf: Masters.settingsURL(for: master))
         else { return nil }
-        return try? JSONDecoder().decode(DevelopSettings.self, from: data)
+        return Settings.decode(DevelopSettings.self, from: data)
     }
 
     func save(_ master: String) {
-        guard !master.isEmpty, let data = try? JSONEncoder().encode(self) else { return }
-        try? data.write(to: Masters.settingsURL(for: master), options: .atomic)
+        guard !master.isEmpty else { return }
+        let url = Masters.settingsURL(for: master)
+        guard let data = Settings.encode(self, carrying: try? Data(contentsOf: url)) else {
+            return
+        }
+        try? data.write(to: url, options: .atomic)
+    }
+}
+
+extension DevelopSettings: Migratable {
+    static let version = 2
+
+    static func migrate(_ object: inout [String: Any], to version: Int) {
+        switch version {
+        case 2:
+            // v1 stored the picker's own label as the value, so renaming a
+            // label in the UI silently reset the setting to its default. These
+            // are the strings that were actually written, frozen here rather
+            // than read off the enum — whose labels are free to change again.
+            Settings.respell(
+                &object, "white",
+                [
+                    "G2V (Sun-like)": "g2v",
+                    "Average spiral galaxy": "spiral",
+                    "A0V (Vega)": "a0v",
+                ])
+            Settings.respell(
+                &object, "palette",
+                [
+                    "Natural": "natural",
+                    "HOO": "hoo",
+                    "OHH": "ohh",
+                    "SHO (synthetic SII)": "sho",
+                ])
+        default:
+            break
+        }
     }
 }
 
