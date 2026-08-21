@@ -70,6 +70,22 @@ scripts/build.sh       cargo -> metallib -> swiftc -> dist/AstroCat.app
 - **The options that produced the layers are recorded** in a `.separation.json` beside them. Without it, changing an option leaves the old pixels in place and reads as the option doing nothing.
 - **GraXpert is not a substitute here.** It does background extraction and denoising, not star removal, so it cannot replace StarNet2 in this slot — it is a candidate for the background-extraction stage we currently do ourselves. Installed at `/Applications/GraXpert.app`. Cosmic Clarity's Darkstar is the free star-removal alternative but is **not installed**, and a registry entry for a tool that cannot be driven reads as a capability — so it is deliberately absent.
 
+## Persistence
+
+Everything the user cannot recreate — develop edits, culling decisions, separation provenance — has to survive the app being replaced under it. The rule is that a release changes the code, never the meaning of a file already on disk.
+
+- **Synthesised `Codable` throws on a missing key even when the property has a default.** Adding one field makes every file written before it unreadable, and the `try?` around the decode turns that into a silent reset. `Settings.decode` merges the file over a default instance and decodes that, so a new field takes its default and every other edit survives. Never call `JSONDecoder` on a settings type directly — conform it to `Migratable` and go through `Settings`.
+- **The merge is recursive**, because a field added to `ToneParams` or `DetailParams` is exactly as fatal as one added to `DevelopSettings`.
+- **A field whose type changed costs that field, not the file.** The decode retries with the offending key replaced by its default, so one bad value cannot take a night's editing with it. A malformed array is replaced whole — the coding path stops at the first index.
+- **Migrations are only for what a default cannot express**: a value spelled differently, or one that now means something else. They are an ordered *list*, not a switch on a separately declared version — the version is `migrations.count + 1`, so a migration cannot be added without the version moving and the version cannot move without a migration to justify it. A file two releases behind runs the steps between where it is and here, in order and once each; measured on a three-step chain, a v1 file walks `v2, v3, v4` and a v3 file only `v4`. A file from a newer build is read as far as this build understands rather than migrated backwards.
+- **An enum's raw value is an identifier, not a label.** `WhiteReference` and `Palette` stored the picker's own text, so renaming "SHO (synthetic SII)" in the UI would have reset the setting for everyone who had it. They store case names now and carry a `label`; v1 files are respelled by a frozen table — the strings that were actually written, not whatever the labels say today.
+- **The TSV header is the schema.** `ingest::load` reads by column name, so a later release can add, drop or reorder a column without shifting every value in every catalogue one place along — which would land a rejection flag in a star count. `columns()` pairs the names with the values so the header and the row cannot drift apart. Verified: re-saving the real 450-frame catalogue is byte-identical to what the positional writer produced.
+- **An older build writing over a newer file does not destroy it.** `Settings.encode` keeps the keys it found and does not understand, so a downgrade costs only what that build could have changed anyway. It stamps its own version, which means the newer build walks those steps again over keys that are already in their final shape — so **a migration has to be safe to run twice.** Write it to match the *old* form and do nothing otherwise: `Settings.respell` looks up the old spelling, and the unit change in the check's three-step fixture only converts a value small enough to still be in the old unit. A migration that transforms blindly would compound. This is the sharpest edge in the design and the only rule the compiler cannot enforce.
+- **Measurements are deliberately not persisted.** Colour calibration is re-fitted from the frame rather than trusted from a file that may now describe other pixels, so a migration never has to reason about whether a stored number is still true.
+- **The stack setup is one struct, not a dozen properties.** `StackSettings` is `StackModel`'s single mutable settings value, so a control added to it is saved because it is there — not because someone remembered a parallel list. It lives in `.astrocat/stack.json`: two projects are two sets of frames and rarely want the same rejection. What the strategist decides (`fullResolution`, `drizzle`) and what the catalogue supplies (`subExptime`) are deliberately outside it — a stored copy would argue with the frames actually going in.
+- **The session selection is stored by night, never by session id.** Ids are positions in the catalogue and move when it is re-ingested. An empty list means all nights, which is also what an unrecorded selection restores to, so a night shot later is included rather than left out of a list written before it existed.
+- Still not persisted, on purpose: zoom, pan, and the before/after view mode. Where you were looking is not an edit.
+
 ## Build
 
 ```bash
@@ -79,6 +95,12 @@ scripts/build.sh       cargo -> metallib -> swiftc -> dist/AstroCat.app
 ```bash
 cargo test --workspace
 ```
+
+```bash
+./scripts/check-settings.sh
+```
+
+The settings checks are two binaries: the mechanism against fixtures that stand in for a file changing shape between releases, and the same guarantee against the real `DevelopSettings` and `StackSettings` — built from the app's own sources minus `App.swift`, whose `@main` cannot coexist with a check's entry point. The second one goes through `StackModel` rather than the struct, so what it checks is the wiring: opening a project reads its file, changing a control writes one. Pass a master path to print what its develop settings actually restore to, read through a copy so nothing is written back.
 
 ## Stacking
 

@@ -60,10 +60,19 @@ enum ColorReference: Int32, CaseIterable {
 /// What should come out neutral, as a Gaia `BP - RP` colour index. The choice
 /// is an editorial one — there is no such thing as the correct white for a
 /// picture of the sky, only a stated one.
+/// The raw values are stable identifiers, not labels. A settings file stores
+/// one, so spelling it the way the picker happens to read today would make a
+/// wording change reset the setting on everyone who had it.
 enum WhiteReference: String, CaseIterable {
-    case g2v = "G2V (Sun-like)"
-    case spiral = "Average spiral galaxy"
-    case a0v = "A0V (Vega)"
+    case g2v, spiral, a0v
+
+    var label: String {
+        switch self {
+        case .g2v: return "G2V (Sun-like)"
+        case .spiral: return "Average spiral galaxy"
+        case .a0v: return "A0V (Vega)"
+        }
+    }
 
     var index: Float {
         switch self {
@@ -118,10 +127,17 @@ struct PaletteMix: Equatable, Codable {
 /// That makes HOO a real mapping and SII a fiction, and the difference is
 /// stated rather than hidden.
 enum Palette: String, CaseIterable {
-    case natural = "Natural"
-    case hoo = "HOO"
-    case ohh = "OHH"
-    case sho = "SHO (synthetic SII)"
+    case natural, hoo, ohh, sho
+
+    /// Stored as the case name, shown as this. See `WhiteReference`.
+    var label: String {
+        switch self {
+        case .natural: return "Natural"
+        case .hoo: return "HOO"
+        case .ohh: return "OHH"
+        case .sho: return "SHO (synthetic SII)"
+        }
+    }
 
     var mix: PaletteMix {
         switch self {
@@ -885,8 +901,8 @@ final class DevelopModel: ObservableObject {
     /// Names the preset the sliders currently sit on, or admits they have moved
     /// off one.
     var paletteName: String {
-        if palette == .natural { return "Natural" }
-        return Palette.allCases.first { $0 != .natural && $0.mix == mix }?.rawValue ?? "Custom"
+        if palette == .natural { return Palette.natural.label }
+        return Palette.allCases.first { $0 != .natural && $0.mix == mix }?.label ?? "Custom"
     }
     private var colorStale = false
     /// Which mode produced `colorCal`, which is not always the selected mode —
@@ -1149,7 +1165,7 @@ final class DevelopModel: ObservableObject {
         s.detail = d.detail
 
         s.enabled = []
-        if d.stretchOn ?? true { s.enabled.insert("Screen stretch") }
+        if d.stretchOn { s.enabled.insert("Screen stretch") }
         if d.colourOn { s.enabled.insert("Colour calibration") }
         if d.paletteOn { s.enabled.insert("Narrowband palette") }
         if d.zonesOn { s.enabled.insert("Zone balance") }
@@ -1161,7 +1177,7 @@ final class DevelopModel: ObservableObject {
         sampleTolerance = d.sampleTolerance
         colorReference = ColorReference(rawValue: d.colourReference) ?? .starField
         whiteReference = WhiteReference(rawValue: d.white) ?? .g2v
-        if d.separationOn == true, layers != nil {
+        if d.separationOn, layers != nil {
             sharedOn.insert("Star separation")
         } else {
             sharedOn.remove("Star separation")
@@ -1495,7 +1511,7 @@ final class DevelopModel: ObservableObject {
             target, object: m.object, frames: m.stackCount, exposure: m.exposure,
             filter: m.filter)
         panel.canCreateDirectories = true
-        panel.message = "\(target.rawValue) — \(width) × \(height), \(target.settings)"
+        panel.message = "\(target.label) — \(width) × \(height), \(target.settings)"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         guard var pixels = renderLayer(active, width: width, height: height) else {
@@ -2151,7 +2167,7 @@ struct DevelopModule: View {
                 Spacer()
                 Picker("", selection: $model.exportTarget) {
                     ForEach(ExportTarget.allCases, id: \.rawValue) { e in
-                        Text(e.rawValue).tag(e)
+                        Text(e.label).tag(e)
                     }
                 }
                 .labelsHidden().frame(width: 130).font(Face.body)
@@ -2471,7 +2487,7 @@ struct DevelopModule: View {
     private var palettePanel: some View {
         VStack(alignment: .leading, spacing: 0) {
             Picker("", selection: $model.palette) {
-                ForEach(Palette.allCases, id: \.rawValue) { p in Text(p.rawValue).tag(p) }
+                ForEach(Palette.allCases, id: \.rawValue) { p in Text(p.label).tag(p) }
             }
             .labelsHidden().font(Face.body).padding(.top, Space.md)
             note(model.palette.note)
@@ -2562,7 +2578,7 @@ struct DevelopModule: View {
                 Text("White").font(Face.body).foregroundStyle(t.t2)
                 Picker("", selection: $model.whiteReference) {
                     ForEach(WhiteReference.allCases, id: \.rawValue) { w in
-                        Text(w.rawValue).tag(w)
+                        Text(w.label).tag(w)
                     }
                 }
                 .labelsHidden().font(Face.body)

@@ -156,16 +156,19 @@ struct SeparationOptions: Equatable, Codable {
     static var stored: SeparationOptions {
         get {
             guard let d = UserDefaults.standard.data(forKey: key),
-                let v = try? JSONDecoder().decode(SeparationOptions.self, from: d)
+                let v = Settings.decode(SeparationOptions.self, from: d)
             else { return SeparationOptions() }
             return v
         }
         set {
-            guard let d = try? JSONEncoder().encode(newValue) else { return }
+            let existing = UserDefaults.standard.data(forKey: key)
+            guard let d = Settings.encode(newValue, carrying: existing) else { return }
             UserDefaults.standard.set(d, forKey: key)
         }
     }
 }
+
+extension SeparationOptions: Migratable {}
 
 /// A star-removal backend: how to invoke it, and which of its quirks the shared
 /// wrapper has to undo afterwards.
@@ -255,9 +258,13 @@ extension StarSeparation {
 
     /// What produced the layers on disk. Recorded so changing an option that
     /// changes the pixels does not silently leave the old ones in place.
-    private struct Provenance: Codable, Equatable {
-        var remover: String
-        var options: SeparationOptions
+    /// Defaulted so it reads back through `Settings`, which needs to be able to
+    /// build a default instance to merge an older file over. An empty remover
+    /// never matches the one being asked for, so a file too damaged to identify
+    /// still reports stale rather than clean.
+    private struct Provenance: Migratable, Equatable {
+        var remover: String = ""
+        var options = SeparationOptions()
     }
 
     private static func provenanceURL(_ master: String) -> URL {
@@ -270,7 +277,7 @@ extension StarSeparation {
     static func provenance(for master: String) -> (remover: String, options: SeparationOptions)? {
         guard exists(for: master),
             let d = try? Data(contentsOf: provenanceURL(master)),
-            let p = try? JSONDecoder().decode(Provenance.self, from: d)
+            let p = Settings.decode(Provenance.self, from: d)
         else { return nil }
         return (p.remover, p.options)
     }
@@ -393,8 +400,11 @@ extension StarSeparation {
             }
         }
 
-        if let d = try? JSONEncoder().encode(Provenance(remover: id, options: options)) {
-            try? d.write(to: provenanceURL(master), options: .atomic)
+        let record = provenanceURL(master)
+        if let d = Settings.encode(
+            Provenance(remover: id, options: options), carrying: try? Data(contentsOf: record))
+        {
+            try? d.write(to: record, options: .atomic)
         }
         return (starless, stars)
     }

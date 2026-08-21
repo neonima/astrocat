@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -5,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::catalog::{Kind, Scan};
 use crate::{fits, stars, to_rgb_half, DetectOpts};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FrameRecord {
     pub id: u32,
     pub path: PathBuf,
@@ -145,7 +146,39 @@ pub fn ingest(scan: &Scan, mut progress: impl FnMut(usize, usize)) -> Vec<FrameR
     out
 }
 
-const HEADER: &str = "id\tpath\tobject\tnight\tfilter\tdate_obs\tsecond\texptime\tgain\tccd_temp\twidth\theight\tstars\thfr\tecc\tbackground\tnoise\tquality\trejected\ttelescope\tra\tdec\tfocal_len\tpixel_size\tscale\thas_wcs\ttrails";
+/// The columns, paired with the values that go in them, so the header and the
+/// row are the same list rather than two lists kept in step by hand.
+fn columns(f: &FrameRecord) -> Vec<(&'static str, String)> {
+    vec![
+        ("id", f.id.to_string()),
+        ("path", f.path.display().to_string()),
+        ("object", f.object.clone()),
+        ("night", f.night.clone()),
+        ("filter", f.filter.clone()),
+        ("date_obs", f.date_obs.clone()),
+        ("second", f.second.to_string()),
+        ("exptime", f.exptime.to_string()),
+        ("gain", f.gain.to_string()),
+        ("ccd_temp", f.ccd_temp.to_string()),
+        ("width", f.width.to_string()),
+        ("height", f.height.to_string()),
+        ("stars", f.stars.to_string()),
+        ("hfr", f.hfr.to_string()),
+        ("ecc", f.ecc.to_string()),
+        ("background", f.background.to_string()),
+        ("noise", f.noise.to_string()),
+        ("quality", f.quality.to_string()),
+        ("rejected", u8::from(f.rejected).to_string()),
+        ("telescope", f.telescope.clone()),
+        ("ra", f.ra.to_string()),
+        ("dec", f.dec.to_string()),
+        ("focal_len", f.focal_len.to_string()),
+        ("pixel_size", f.pixel_size.to_string()),
+        ("scale", f.scale.to_string()),
+        ("has_wcs", u8::from(f.has_wcs).to_string()),
+        ("trails", f.trails.to_string()),
+    ]
+}
 
 pub fn catalog_dir(project: &Path) -> PathBuf {
     project.join(".astrocat")
@@ -155,81 +188,76 @@ pub fn save(project: &Path, frames: &[FrameRecord]) -> std::io::Result<()> {
     let dir = catalog_dir(project);
     fs::create_dir_all(&dir)?;
     let mut w = fs::File::create(dir.join("frames.tsv"))?;
-    writeln!(w, "{HEADER}")?;
+
+    let header: Vec<&str> = columns(&FrameRecord::default())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    writeln!(w, "{}", header.join("\t"))?;
+
     for f in frames {
-        writeln!(
-            w,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            f.id,
-            f.path.display(),
-            f.object,
-            f.night,
-            f.filter,
-            f.date_obs,
-            f.second,
-            f.exptime,
-            f.gain,
-            f.ccd_temp,
-            f.width,
-            f.height,
-            f.stars,
-            f.hfr,
-            f.ecc,
-            f.background,
-            f.noise,
-            f.quality,
-            u8::from(f.rejected),
-            f.telescope,
-            f.ra,
-            f.dec,
-            f.focal_len,
-            f.pixel_size,
-            f.scale,
-            u8::from(f.has_wcs),
-            f.trails
-        )?;
+        let row: Vec<String> = columns(f).into_iter().map(|(_, value)| value).collect();
+        writeln!(w, "{}", row.join("\t"))?;
     }
     Ok(())
 }
 
+/// The header line is the schema. Reading by column name rather than by
+/// position is what lets a later release add, drop or reorder a column without
+/// shifting every value in every catalogue already on disk one place along —
+/// which would land a rejection flag in a star count and lose a night of
+/// culling without saying so. A column this build does not know is ignored; one
+/// the file does not carry takes its default.
 pub fn load(project: &Path) -> std::io::Result<Vec<FrameRecord>> {
     let text = fs::read_to_string(catalog_dir(project).join("frames.tsv"))?;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Ok(Vec::new());
+    };
+    let index: BTreeMap<&str, usize> = header
+        .split('\t')
+        .map(str::trim)
+        .zip(0..)
+        .collect();
+
     let mut out = Vec::new();
-    for line in text.lines().skip(1) {
-        let c: Vec<&str> = line.split('\t').collect();
-        if c.len() < 19 {
-            continue;
-        }
-        // Older catalogs stop at column 19; treat the rest as absent.
-        let at = |i: usize| c.get(i).copied().unwrap_or("");
+    for line in lines.filter(|l| !l.trim().is_empty()) {
+        let cells: Vec<&str> = line.split('\t').collect();
+        let at = |name: &str| -> &str {
+            index
+                .get(name)
+                .and_then(|i| cells.get(*i))
+                .copied()
+                .unwrap_or("")
+        };
         out.push(FrameRecord {
-            id: c[0].parse().unwrap_or(0),
-            path: PathBuf::from(c[1]),
-            object: c[2].into(),
-            night: c[3].into(),
-            filter: c[4].into(),
-            date_obs: c[5].into(),
-            second: c[6].parse().unwrap_or(0),
-            exptime: c[7].parse().unwrap_or(0.0),
-            gain: c[8].parse().unwrap_or(0.0),
-            ccd_temp: c[9].parse().unwrap_or(0.0),
-            width: c[10].parse().unwrap_or(0),
-            height: c[11].parse().unwrap_or(0),
-            stars: c[12].parse().unwrap_or(0),
-            hfr: c[13].parse().unwrap_or(0.0),
-            ecc: c[14].parse().unwrap_or(0.0),
-            background: c[15].parse().unwrap_or(0.0),
-            noise: c[16].parse().unwrap_or(0.0),
-            quality: c[17].parse().unwrap_or(0.0),
-            rejected: c[18] == "1",
-            telescope: at(19).to_string(),
-            ra: at(20).parse().unwrap_or(0.0),
-            dec: at(21).parse().unwrap_or(0.0),
-            focal_len: at(22).parse().unwrap_or(0.0),
-            pixel_size: at(23).parse().unwrap_or(0.0),
-            scale: at(24).parse().unwrap_or(0.0),
-            has_wcs: at(25) == "1",
-            trails: at(26).parse().unwrap_or(0),
+            id: at("id").parse().unwrap_or(0),
+            path: PathBuf::from(at("path")),
+            object: at("object").into(),
+            night: at("night").into(),
+            filter: at("filter").into(),
+            date_obs: at("date_obs").into(),
+            second: at("second").parse().unwrap_or(0),
+            exptime: at("exptime").parse().unwrap_or(0.0),
+            gain: at("gain").parse().unwrap_or(0.0),
+            ccd_temp: at("ccd_temp").parse().unwrap_or(0.0),
+            width: at("width").parse().unwrap_or(0),
+            height: at("height").parse().unwrap_or(0),
+            stars: at("stars").parse().unwrap_or(0),
+            hfr: at("hfr").parse().unwrap_or(0.0),
+            ecc: at("ecc").parse().unwrap_or(0.0),
+            background: at("background").parse().unwrap_or(0.0),
+            noise: at("noise").parse().unwrap_or(0.0),
+            quality: at("quality").parse().unwrap_or(0.0),
+            rejected: at("rejected") == "1",
+            telescope: at("telescope").into(),
+            ra: at("ra").parse().unwrap_or(0.0),
+            dec: at("dec").parse().unwrap_or(0.0),
+            focal_len: at("focal_len").parse().unwrap_or(0.0),
+            pixel_size: at("pixel_size").parse().unwrap_or(0.0),
+            scale: at("scale").parse().unwrap_or(0.0),
+            has_wcs: at("has_wcs") == "1",
+            trails: at("trails").parse().unwrap_or(0),
         });
     }
     Ok(out)
@@ -295,5 +323,95 @@ mod tests {
         assert_eq!(back[0].night, "2026-08-14");
         assert!(back[0].rejected);
         assert!((back[0].quality - 0.75).abs() < 1e-6);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(catalog_dir(&dir)).unwrap();
+        dir
+    }
+
+    /// Every field distinct, so a column written under the wrong header changes
+    /// the record it comes back as.
+    fn distinct() -> FrameRecord {
+        FrameRecord {
+            id: 1,
+            path: PathBuf::from("/x/y.fit"),
+            object: "NGC 7000".into(),
+            night: "2026-08-14".into(),
+            filter: "LP".into(),
+            date_obs: "2026-08-14T23:06:42".into(),
+            second: 12345,
+            exptime: 30.5,
+            gain: 80.0,
+            ccd_temp: -9.25,
+            width: 3840,
+            height: 2160,
+            stars: 885,
+            hfr: 0.63,
+            ecc: 0.41,
+            background: 0.0018,
+            noise: 6.4e-5,
+            quality: 0.75,
+            rejected: true,
+            telescope: "Seestar S30".into(),
+            ra: 314.8088,
+            dec: 44.5387,
+            focal_len: 250.0,
+            pixel_size: 2.9,
+            scale: 3.674,
+            has_wcs: true,
+            trails: 3,
+        }
+    }
+
+    #[test]
+    fn every_column_round_trips() {
+        let dir = scratch("astrocat-ingest-columns");
+        save(&dir, &[distinct()]).unwrap();
+        assert_eq!(load(&dir).unwrap(), vec![distinct()]);
+    }
+
+    fn write_tsv(dir: &Path, header: &str, row: &str) {
+        fs::write(
+            catalog_dir(dir).join("frames.tsv"),
+            format!("{header}\n{row}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn columns_are_read_by_name_not_position() {
+        let dir = scratch("astrocat-ingest-reordered");
+        write_tsv(
+            &dir,
+            "rejected\tstars\tid\tobject\tquality",
+            "1\t885\t7\tNGC 7000\t0.75",
+        );
+        let back = load(&dir).unwrap();
+        assert_eq!(back[0].id, 7);
+        assert_eq!(back[0].stars, 885);
+        assert_eq!(back[0].object, "NGC 7000");
+        assert!(back[0].rejected);
+    }
+
+    #[test]
+    fn a_column_the_file_lacks_takes_its_default() {
+        let dir = scratch("astrocat-ingest-missing");
+        write_tsv(&dir, "id\tstars\trejected", "3\t885\t1");
+        let back = load(&dir).unwrap();
+        assert_eq!(back[0].trails, 0);
+        assert_eq!(back[0].stars, 885);
+        assert!(back[0].rejected);
+    }
+
+    #[test]
+    fn a_column_this_build_does_not_know_is_ignored() {
+        let dir = scratch("astrocat-ingest-unknown");
+        write_tsv(&dir, "id\tsnr\tstars\trejected", "3\t42.0\t885\t1");
+        let back = load(&dir).unwrap();
+        assert_eq!(back[0].stars, 885);
+        assert!(back[0].rejected);
     }
 }

@@ -48,7 +48,7 @@ enum Exporter {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = suggested
         panel.canCreateDirectories = true
-        panel.message = "\(target.rawValue) — \(target.settings)"
+        panel.message = "\(target.label) — \(target.settings)"
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
 
         if target == .lightroom {
@@ -58,7 +58,7 @@ enum Exporter {
         if target.isFinishedImage {
             // These go through `exportImage` on the model, which has the
             // renderer. Reaching here means a caller took the wrong path.
-            return "\(target.rawValue) is exported from the develop view."
+            return "\(target.label) is exported from the develop view."
         }
 
         let c = conventions(target)
