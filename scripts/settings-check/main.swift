@@ -37,14 +37,9 @@ struct Fixture: Migratable, Equatable {
     /// Stands in for a field added by a later release.
     var added: Int = 42
 
-    static let version = 2
-
-    static func migrate(_ object: inout [String: Any], to version: Int) {
-        switch version {
-        case 2: Settings.respell(&object, "name", ["Natural": "natural", "HOO": "hoo"])
-        default: break
-        }
-    }
+    static let migrations: [(inout [String: Any]) -> Void] = [
+        { Settings.respell(&$0, "name", ["Natural": "natural", "HOO": "hoo"]) }
+    ]
 }
 
 // A file written by an earlier build: no version, no `added` anywhere, and the
@@ -144,6 +139,58 @@ twice["name"] = "hoo"
 check(
     "a migration run a second time leaves the value alone",
     Settings.decode(Fixture.self, from: json(twice))?.name == "hoo")
+
+// Three format changes stacked up, which is the case a single-step check
+// cannot speak for: a file skipping several releases has to walk every step
+// between where it is and here, in order and exactly once each.
+struct Aged: Migratable, Equatable {
+    var name: String = ""
+    var seconds: Int = 0
+    var trail: [String] = []
+
+    static let migrations: [(inout [String: Any]) -> Void] = [
+        // 1 -> 2: the label became an identifier.
+        {
+            Settings.respell(&$0, "name", ["Full resolution": "full"])
+            $0["trail"] = (($0["trail"] as? [String]) ?? []) + ["v2"]
+        },
+        // 2 -> 3: a field the user set was renamed.
+        {
+            if let old = $0.removeValue(forKey: "minutes") { $0["seconds"] = old }
+            $0["trail"] = (($0["trail"] as? [String]) ?? []) + ["v3"]
+        },
+        // 3 -> 4: and its unit changed under it. Written to match the old form
+        // rather than applied blindly, so a second run is a no-op.
+        {
+            if let minutes = $0["seconds"] as? Int, minutes < 100 { $0["seconds"] = minutes * 60 }
+            $0["trail"] = (($0["trail"] as? [String]) ?? []) + ["v4"]
+        },
+    ]
+}
+
+check("the version is the migration count plus one", Aged.version == 4)
+
+let ancient = Settings.decode(Aged.self, from: json(["name": "Full resolution", "minutes": 5]))
+check("a v1 file walks every step", ancient?.trail == ["v2", "v3", "v4"])
+check("and arrives at the current shape", ancient?.name == "full" && ancient?.seconds == 300)
+
+let midway = Settings.decode(
+    Aged.self, from: json([Settings.versionKey: 3, "name": "full", "seconds": 5]))
+check("a v3 file runs only the last step", midway?.trail == ["v4"])
+check("and is not re-migrated from the start", midway?.seconds == 300)
+
+let already = Settings.decode(
+    Aged.self, from: json([Settings.versionKey: 4, "name": "full", "seconds": 300]))
+check("a current file runs none of them", already?.trail == [])
+
+// The round trip an old build in the middle of the chain forces: it writes
+// back at its own version, so the newer build walks those steps again.
+var downgraded = json([Settings.versionKey: 4, "name": "full", "seconds": 300])
+let afterOldBuild = Settings.encode(Aged(name: "full", seconds: 300), carrying: downgraded)
+downgraded = afterOldBuild!
+check(
+    "a re-run of the whole chain does not compound",
+    Settings.decode(Aged.self, from: downgraded)?.seconds == 300)
 
 check("garbage is refused rather than half-read", Settings.decode(Fixture.self, from: Data()) == nil)
 check(

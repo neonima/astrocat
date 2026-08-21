@@ -559,7 +559,10 @@ final class DevelopModel: ObservableObject {
     /// Twenty seconds of inference, so it runs once and caches beside the
     /// master. Off the main thread, and reporting failure rather than leaving
     /// the button looking like it worked.
-    func separateStars(force: Bool = false) {
+    /// `enteringSplit` is false when the run was not asked for — redoing layers
+    /// the restack invalidated should put back what you had, not switch on a
+    /// split you had switched off.
+    func separateStars(force: Bool = false, enteringSplit: Bool = true) {
         guard !source.isEmpty, !separating else { return }
         let model = StarSeparation.remover(removerID)
         let options = separationOptions
@@ -582,8 +585,10 @@ final class DevelopModel: ObservableObject {
                     self.attachLayers(for: path)
                     // Straight into the split: separating and then having to go
                     // and find the layers yourself is a step with no purpose.
-                    self.sharedOn.insert("Star separation")
-                    self.activeLayer = .starless
+                    if enteringSplit {
+                        self.sharedOn.insert("Star separation")
+                        self.activeLayer = .starless
+                    }
                     self.push()
                 }
             } catch {
@@ -593,6 +598,26 @@ final class DevelopModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Redoes what a restack invalidated.
+    ///
+    /// Restacking overwrites the master in place — that is what keeps the
+    /// develop parameters attached to it — but star separation is the one stage
+    /// whose result lives in a file rather than being recomputed on the way to
+    /// the screen, so it is the one thing that has to be run again. Everything
+    /// else in the pipeline is parameters over whatever pixels are there now.
+    ///
+    /// Re-run with the settings recorded beside the layers, not with whatever
+    /// the panel is showing: those are the ones that made the picture being
+    /// restored.
+    private func reseparateIfStale(_ path: String) {
+        guard let p = StarSeparation.provenance(for: path),
+            StarSeparation.masterIsNewer(than: path)
+        else { return }
+        removerID = p.remover
+        separationOptions = p.options
+        separateStars(force: true, enteringSplit: false)
     }
 
     /// Builds a live state for each layer, or clears both when the files are
@@ -1270,6 +1295,7 @@ final class DevelopModel: ObservableObject {
             // than trusted from a file that may describe other pixels.
             measureColour()
         }
+        reseparateIfStale(path)
     }
 
     /// Measured by fitting the background model, not guessed from MAD.
@@ -1560,11 +1586,19 @@ struct DevelopModule: View {
         }
         .onAppear {
             model.masters = Masters.all(stacker.projectRoot)
-            if model.meta == nil {
+            let out = stacker.outputPath
+            let stacked = !out.isEmpty && FileManager.default.fileExists(atPath: out)
+
+            // A stack that has just finished wins even over a master already
+            // open. That is the restack case: rejecting a frame and stacking
+            // again is pointless if Develop keeps showing the old result.
+            if stacked && stacker.freshResult {
+                stacker.freshResult = false
+                model.load(out)
+            } else if model.meta == nil {
                 // Whatever was just stacked, else the newest saved master —
                 // reopening a project should not mean stacking it again.
-                let out = stacker.outputPath
-                if !out.isEmpty, FileManager.default.fileExists(atPath: out) {
+                if stacked {
                     model.load(out)
                 } else if let saved = model.masters.first {
                     model.load(saved.path)

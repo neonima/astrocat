@@ -102,8 +102,6 @@ struct StackSettings: Equatable {
 }
 
 extension StackSettings: Migratable {
-    static let version = 1
-
     static func url(_ project: String) -> URL {
         URL(fileURLWithPath: project)
             .appendingPathComponent(".astrocat", isDirectory: true)
@@ -130,7 +128,11 @@ final class StackModel: ObservableObject {
     @Published var seestarStars = 0
     @Published var subStars = 0
     @Published var viewMode = 0
-    var filename: String { "NGC7000_\(job.frames_used)x60s_LP.fit" }
+    /// Where this stack will actually land, so it can be read before running
+    /// rather than being a hardcoded example of what one looks like.
+    func plannedFilename(_ frames: [Frame]) -> String {
+        URL(fileURLWithPath: destination(for: frames)).lastPathComponent
+    }
     /// Decided at the moment a stack starts, by the strategist or by
     /// `settings.choice`. Not settings, so not saved.
     @Published var fullResolution = true
@@ -149,6 +151,11 @@ final class StackModel: ObservableObject {
         }
     }
     @Published var exportError: String?
+    /// A stack has finished and Develop has not opened it yet. Without this a
+    /// restack overwrites the master and Develop carries on showing the pixels
+    /// it already had — which looks exactly like the restack having done
+    /// nothing, and is the same path so nothing else would notice.
+    @Published var freshResult = false
 
     private var timer: Timer?
     private var saveTimer: Timer?
@@ -256,7 +263,11 @@ final class StackModel: ObservableObject {
 
     /// A stack costs minutes, so it lands in the project under a name that says
     /// what it is. Only an unopened project falls back to a temp file.
-    private func destination(for frames: [Frame]) -> String {
+    ///
+    /// The same frames stacked again land on the same path, which is the point:
+    /// the `.develop.json` beside it is still there, so restacking without the
+    /// frame you rejected costs the stack and nothing else.
+    func destination(for frames: [Frame]) -> String {
         guard !projectRoot.isEmpty else {
             return FileManager.default.temporaryDirectory
                 .appendingPathComponent("astrocat-stack.fit").path
@@ -264,14 +275,12 @@ final class StackModel: ObservableObject {
         // From the frames going in, not from the exposure picker — those can
         // disagree, and a name that misreports the integration is worse than no
         // name at all.
-        var exposures = frames.map(\.exptime).sorted()
+        let exposures = frames.map(\.exptime).sorted()
         let name = Masters.name(
             object: frames.first?.object ?? "",
-            frames: frames.count,
             exposure: exposures.isEmpty ? subExptime : exposures[exposures.count / 2],
             filter: frames.first?.filter ?? "",
             night: String((frames.first?.date ?? "").prefix(10)))
-        exposures.removeAll()
         return Masters.ensure(projectRoot).appendingPathComponent(name).path
     }
 
@@ -334,7 +343,10 @@ final class StackModel: ObservableObject {
                 self.message = String(cString: ac_job_message())
                 if j.state != 1 {
                     tm.invalidate()
-                    if j.state == 2 { self.loadResult() }
+                    if j.state == 2 {
+                        self.freshResult = true
+                        self.loadResult()
+                    }
                 }
             }
         }
@@ -637,7 +649,9 @@ struct StackModule: View {
             note(
                 j.state == 4
                     ? "Cancelling discards the partial result and keeps the cached analysis."
-                    : "Nothing is written until the last stage finishes. Cancelling discards the partial result and keeps the cached analysis.")
+                    : restacking
+                        ? "Writes over \(model.plannedFilename(frames)), which is what keeps your develop parameters: they live beside the master under that name. Reject a bad frame in the Library, stack again, and the edits are still there. Nothing is written until the last stage finishes."
+                        : "Nothing is written until the last stage finishes. Cancelling discards the partial result and keeps the cached analysis.")
         }
         .padding(Metric.panelPad)
         .background(t.s2)
@@ -645,6 +659,12 @@ struct StackModule: View {
             RoundedRectangle(cornerRadius: Radius.panel)
                 .stroke(border, lineWidth: j.state >= 3 ? 1 : 0.5))
         .clipShape(RoundedRectangle(cornerRadius: Radius.panel))
+    }
+
+    /// A master of this picture is already on disk, so this run replaces it.
+    private var restacking: Bool {
+        !frames.isEmpty
+            && FileManager.default.fileExists(atPath: model.destination(for: frames))
     }
 
     /// Read from the catalog for the frames actually selected, rather than
@@ -875,7 +895,7 @@ struct StackModule: View {
                 info("Data", model.settings.target.data)
                 info("Pedestal", model.settings.target.pedestal)
                 info("Bayer", "none — already debayered")
-                info("Filename", model.filename)
+                info("Filename", model.plannedFilename(frames))
                 note(model.settings.target.reason)
 
                 HStack(spacing: Space.sm) {

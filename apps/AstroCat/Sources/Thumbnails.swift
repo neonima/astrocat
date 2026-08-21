@@ -76,6 +76,11 @@ final class ThumbnailStore: ObservableObject {
 struct Thumbnail: View {
     let path: String
     var size: Int = 96
+    /// `.fill` crops to the box. Right for a grid cell, wrong for a preview
+    /// meant to be judged: these frames are portrait and the panes are not, so
+    /// filling shows the middle tenth and hides the corners, which is where
+    /// trailing and field rotation appear first.
+    var mode: ContentMode = .fill
     @ObservedObject var store: ThumbnailStore
     let placeholder: Color
 
@@ -84,7 +89,7 @@ struct Thumbnail: View {
             if let img = store.image(path, size: size) {
                 Image(decorative: img, scale: 1)
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .aspectRatio(contentMode: mode)
                     .frame(width: geo.size.width, height: geo.size.height)
                     .clipped()
             } else {

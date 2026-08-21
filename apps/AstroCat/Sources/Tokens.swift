@@ -60,7 +60,6 @@ enum Metric {
     static let statusBar: CGFloat = 26
     static let panelPad: CGFloat = 12
     static let rowHeight: CGFloat = 28
-    static let frameCell: CGFloat = 48
     static let frameGap: CGFloat = 6
     /// Clears the window's traffic lights when the title bar is hidden.
     static let trafficLightInset: CGFloat = 78

@@ -168,9 +168,7 @@ struct SeparationOptions: Equatable, Codable {
     }
 }
 
-extension SeparationOptions: Migratable {
-    static let version = 1
-}
+extension SeparationOptions: Migratable {}
 
 /// A star-removal backend: how to invoke it, and which of its quirks the shared
 /// wrapper has to undo afterwards.
@@ -267,8 +265,6 @@ extension StarSeparation {
     private struct Provenance: Migratable, Equatable {
         var remover: String = ""
         var options = SeparationOptions()
-
-        static let version = 1
     }
 
     private static func provenanceURL(_ master: String) -> URL {
@@ -289,7 +285,29 @@ extension StarSeparation {
     static func isStale(for master: String, remover: String, options: SeparationOptions) -> Bool {
         guard exists(for: master) else { return false }
         guard let p = provenance(for: master) else { return true }
-        return p.remover != remover || p.options != options
+        return p.remover != remover || p.options != options || masterIsNewer(than: master)
+    }
+
+    /// The master has been written since its layers were extracted, so they
+    /// describe pixels that are gone.
+    ///
+    /// Restacking overwrites the master in place — that is what keeps the
+    /// develop parameters attached to it — and star separation is the one part
+    /// of the pipeline that cannot simply be recomputed on the way to the
+    /// screen. Without this the old starless layer stays beside the new master,
+    /// in register and quietly wrong: the frame you rejected is still in it.
+    static func masterIsNewer(than master: String) -> Bool {
+        func modified(_ url: URL) -> Date? {
+            try? url.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate
+        }
+        guard let m = modified(URL(fileURLWithPath: master)),
+            let l = modified(starlessURL(for: master))
+        else { return false }
+        // A second of slack: the two are written seconds apart by different
+        // processes and the filesystem's resolution is not worth trusting to
+        // the microsecond.
+        return m.timeIntervalSince(l) > 1
     }
 
     /// Returns the two layer paths, running the model only when they are

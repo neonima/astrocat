@@ -17,15 +17,20 @@ enum Masters {
         return dir
     }
 
-    /// Enough to tell two stacks of the same target apart in a list: what, how
-    /// many frames, how long each, through what filter, and which night.
-    static func name(object: String, frames: Int, exposure: Float, filter: String, night: String)
-        -> String
-    {
+    /// Enough to tell two stacks apart in a list: what, how long each sub was,
+    /// through what filter, and which night.
+    ///
+    /// Deliberately *not* the frame count. Rejecting a bad frame and stacking
+    /// again is the same picture made better, and if the count were in the name
+    /// it would land beside the old one under a new name — taking it out of
+    /// reach of the `.develop.json` sitting next to the old one, which is how
+    /// an evening's editing used to be lost to one soft sub. The count is in
+    /// the header as STACKCNT, which is where a number that changes belongs.
+    static func name(object: String, exposure: Float, filter: String, night: String) -> String {
         let target = object.isEmpty ? "Stack" : object.replacingOccurrences(of: " ", with: "")
         let band = filter.isEmpty ? "LP" : filter
         let when = night.isEmpty ? "" : "_\(night.replacingOccurrences(of: "-", with: ""))"
-        return String(format: "%@_%dx%.0fs_%@%@.fit", target, frames, exposure, band, when)
+        return String(format: "%@_%.0fs_%@%@.fit", target, exposure, band, when)
     }
 
     static func all(_ project: String) -> [URL] {
@@ -169,15 +174,12 @@ struct DevelopSettings: Codable, Equatable {
 }
 
 extension DevelopSettings: Migratable {
-    static let version = 2
-
-    static func migrate(_ object: inout [String: Any], to version: Int) {
-        switch version {
-        case 2:
-            // v1 stored the picker's own label as the value, so renaming a
-            // label in the UI silently reset the setting to its default. These
-            // are the strings that were actually written, frozen here rather
-            // than read off the enum — whose labels are free to change again.
+    static let migrations: [(inout [String: Any]) -> Void] = [
+        // 1 -> 2. v1 stored the picker's own label as the value, so renaming a
+        // label in the UI silently reset the setting to its default. These are
+        // the strings that were actually written, frozen here rather than read
+        // off the enum — whose labels are free to change again.
+        { object in
             Settings.respell(
                 &object, "white",
                 [
@@ -193,10 +195,8 @@ extension DevelopSettings: Migratable {
                     "OHH": "ohh",
                     "SHO (synthetic SII)": "sho",
                 ])
-        default:
-            break
         }
-    }
+    ]
 }
 
 /// Lightroom-style tonal controls, in the same ranges the Lighthouse script

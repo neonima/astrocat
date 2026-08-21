@@ -22,7 +22,42 @@ enum SheetFilter: String, CaseIterable {
 }
 
 enum LibraryView: String, CaseIterable {
-    case trace = "Trace", metrics = "Metrics", rank = "Rank", grid = "Grid"
+    case trace = "Trace", metrics = "Metrics", rank = "Rank", grid = "Grid", frame = "Frame"
+}
+
+/// How big the contact sheet's cells are.
+///
+/// Cells follow the frame's own aspect rather than a fixed landscape box: these
+/// subs are 2160 x 3840, so a landscape cell showed a centre crop of every one
+/// of them, and the corners — where trailing and field rotation show first —
+/// were never on screen at all.
+enum SheetSize: String, CaseIterable {
+    case small = "S", medium = "M", large = "L"
+
+    var width: CGFloat {
+        switch self {
+        case .small: return 58
+        case .medium: return 104
+        case .large: return 168
+        }
+    }
+
+    func height(_ aspect: CGFloat) -> CGFloat {
+        // Bounded so an unusual sensor still lays out in rows.
+        (width / max(min(aspect, 3), 0.33)).rounded()
+    }
+
+    /// Fixed tiers rather than the display size, so `.astrocat/thumbs` holds
+    /// three sets and not one per layout the window has ever been.
+    var thumb: Int {
+        switch self {
+        case .small: return 96
+        case .medium: return 192
+        case .large: return 384
+        }
+    }
+
+    var showsMetrics: Bool { self != .small }
 }
 
 /// Shared so the sub-toolbar and the module resolve the same ordinal range.
@@ -208,10 +243,22 @@ struct LibraryModule: View {
     @ObservedObject var thumbs: ThumbnailStore
     @Environment(\.tokens) private var t
 
+    /// Held here rather than in the shell: it owns a Metal texture and a 17 MB
+    /// decode, and nothing outside the Library addresses it.
+    @StateObject private var loupe = FrameLoupe()
+
     private var cursor: Int { shell.cursor }
     private var ordered: [Frame] { orderedVisible(catalog, shell) }
     private var selection: Set<Int> { librarySelection(catalog, shell) }
     @State private var sheetFilter: SheetFilter = .all
+    @State private var sheetSize: SheetSize = .medium
+
+    /// The cell shape, taken from the frames themselves. These are portrait
+    /// subs; assuming landscape showed a centre crop of every one.
+    private var cellAspect: CGFloat {
+        guard let f = catalog.current.first, f.width > 0, f.height > 0 else { return 1.29 }
+        return CGFloat(f.width) / CGFloat(f.height)
+    }
 
     private var sheetFrames: [Frame] {
         switch sheetFilter {
@@ -228,7 +275,10 @@ struct LibraryModule: View {
             Divider().overlay(t.line)
             centre
             Divider().overlay(t.line)
-            inspector.frame(width: 316, alignment: .leading).background(t.s1)
+            // The constant, not a repeat of its value: the preview sizes itself
+            // against the same number and a drift between them would crop it.
+            inspector.frame(width: Module.library.inspectorWidth, alignment: .leading)
+                .background(t.s1)
         }
         .focusable()
         .onKeyPress { press in handleKey(press) }
@@ -262,26 +312,40 @@ struct LibraryModule: View {
         case "2": shell.libraryView = .metrics; return .handled
         case "3": shell.libraryView = .rank; return .handled
         case "4": shell.libraryView = .grid; return .handled
+        case "5": shell.libraryView = .frame; return .handled
         default: return .ignored
         }
     }
 
-    private var centre: some View {
-        VStack(spacing: 0) {
-            traceHeader
-            chart
-                .frame(height: shell.libraryView == .grid ? 44 : 222)
-                .background(t.s0)
-            Divider().overlay(t.line)
-            sheetHeader
-            contactSheet
+    @ViewBuilder private var centre: some View {
+        if shell.libraryView == .frame {
+            VStack(spacing: 0) {
+                traceHeader
+                Divider().overlay(t.line)
+                LoupePane(
+                    loupe: loupe, catalog: catalog, shell: shell, thumbs: thumbs,
+                    frames: ordered, selection: selection, aspect: cellAspect, tokens: t)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            VStack(spacing: 0) {
+                traceHeader
+                chart
+                    .frame(height: shell.libraryView == .grid ? 44 : 222)
+                    .background(t.s0)
+                Divider().overlay(t.line)
+                sheetHeader
+                contactSheet
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(t.well)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(t.well)
     }
 
     @ViewBuilder private var chart: some View {
         switch shell.libraryView {
+        case .frame:
+            EmptyView()
         case .trace, .grid:
             TraceChart(
                 frames: catalog.current, selected: selection, cursor: cursor,
@@ -360,6 +424,12 @@ struct LibraryModule: View {
                 }
             }
             Text("worst → best").font(Face.mono(10)).foregroundStyle(t.t3)
+            Segmented(
+                items: SheetSize.allCases.map(\.rawValue),
+                index: Binding(
+                    get: { SheetSize.allCases.firstIndex(of: sheetSize) ?? 0 },
+                    set: { sheetSize = SheetSize.allCases[$0] }),
+                padding: Space.sm)
         }
         .padding(.horizontal, Metric.panelPad)
         .frame(height: 24)
@@ -368,20 +438,28 @@ struct LibraryModule: View {
 
     private var contactSheet: some View {
         ScrollView {
+            // Adaptive rather than a fixed column count: the 21 columns that
+            // filled the pane at 62 px leave three quarters of it empty at 168.
             LazyVGrid(
-                columns: Array(
-                    repeating: GridItem(.fixed(62), spacing: Metric.frameGap),
-                    count: 21),
+                columns: [GridItem(.adaptive(minimum: sheetSize.width), spacing: Metric.frameGap)],
                 spacing: Metric.frameGap
             ) {
                 ForEach(Array(sheetFrames.enumerated()), id: \.element.id) { i, f in
                     FrameCell(
                         frame: f, index: i + 1, selected: selection.contains(f.id),
-                        thumbs: thumbs, tokens: t
+                        size: sheetSize, aspect: cellAspect, thumbs: thumbs, tokens: t
                     )
                     // Without an explicit shape only the opaque parts of the
                     // cell take a tap, so clicks land unreliably.
                     .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        // Straight to the frame at full resolution. Judging a
+                        // sub from a thumbnail is what that view is there to
+                        // stop.
+                        shell.cursor = ordered.firstIndex { $0.id == f.id } ?? i
+                        shell.anchor = nil
+                        shell.libraryView = .frame
+                    }
                     .onTapGesture {
                         // Touching a frame hands control back to the cursor;
                         // a rank cut would otherwise swallow every selection.
@@ -597,20 +675,7 @@ struct LibraryModule: View {
                     .padding(.bottom, Space.sm)
                 }
 
-                ZStack(alignment: .bottomLeading) {
-                    Thumbnail(
-                        path: f?.path ?? "", size: 480, store: thumbs, placeholder: t.img)
-                        .frame(height: 220)
-                    if selection.count > 1 {
-                        Text("best of \(selection.count) selected")
-                            .font(Face.mono(9)).foregroundStyle(t.t2)
-                            .padding(4)
-                            .background(t.well.opacity(0.75))
-                    }
-                }
-                .frame(height: 220)
-                .background(t.img)
-                .clipShape(RoundedRectangle(cornerRadius: Radius.panel))
+                preview(f)
 
                 if let f {
                     sectionHeader("Measured").padding(.top, Space.xl)
@@ -664,6 +729,54 @@ struct LibraryModule: View {
         }
     }
 
+    /// The selected frame, whole, at its own shape and as large as the pane
+    /// allows — this is the picture, not a decoration on a list of numbers, and
+    /// it is what tells you a sub is wrong before any of the numbers do.
+    ///
+    /// Sized from the frame itself: a fixed landscape box cropped these
+    /// portrait subs to their middle tenth.
+    @ViewBuilder private func preview(_ f: Frame?) -> some View {
+        let available = Module.library.inspectorWidth - Metric.panelPad * 2
+        let aspect = f.map { $0.width > 0 && $0.height > 0
+            ? CGFloat($0.width) / CGFloat($0.height) : cellAspect } ?? cellAspect
+        // Capped so the measurements below stay within a short scroll.
+        let height = min(available / aspect, 460)
+        let width = height * aspect
+
+        ZStack(alignment: .bottomLeading) {
+            Thumbnail(
+                path: f?.path ?? "", size: 480, mode: .fit, store: thumbs, placeholder: t.img)
+                .frame(width: width, height: height)
+
+            if selection.count > 1 {
+                Text("best of \(selection.count) selected")
+                    .font(Face.mono(9)).foregroundStyle(t.t2)
+                    .padding(4)
+                    .background(t.well.opacity(0.75))
+            }
+            if let f, f.rejected {
+                Text("REJECTED").font(Face.mono(9, .medium))
+                    .foregroundStyle(t.selT)
+                    .padding(.horizontal, 4).frame(height: 14)
+                    .background(t.q1.opacity(0.85))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+        }
+        .frame(width: width, height: height)
+        .background(t.img)
+        .clipShape(RoundedRectangle(cornerRadius: Radius.panel))
+        .overlay(
+            RoundedRectangle(cornerRadius: Radius.panel)
+                .stroke(f?.rejected == true ? t.q1 : t.line, lineWidth: 0.5))
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        // The thumbnail is still a thumbnail — half-res and box-filtered down,
+        // so a 1–2 px star is a smudge in it. Clicking goes to the frame at its
+        // own resolution, which is the only place focus can actually be judged.
+        .onTapGesture { if f != nil { shell.libraryView = .frame } }
+        .help("Open at full resolution")
+    }
+
     private func sectionHeader(_ s: String) -> some View {
         Text(s.uppercased())
             .font(Face.sectionHeader)
@@ -686,13 +799,15 @@ struct FrameCell: View {
     let frame: Frame
     var index = 0
     let selected: Bool
+    var size: SheetSize = .small
+    var aspect: CGFloat = 1.29
     @ObservedObject var thumbs: ThumbnailStore
     let tokens: Tokens
 
     var body: some View {
         let q = tokens.quality(Double(frame.quality))
         ZStack(alignment: .topLeading) {
-            Thumbnail(path: frame.path, size: 96, store: thumbs, placeholder: tokens.s2)
+            Thumbnail(path: frame.path, size: size.thumb, store: thumbs, placeholder: tokens.s2)
 
             // Scrim so the values stay legible over whatever the sky is doing.
             LinearGradient(
@@ -707,17 +822,19 @@ struct FrameCell: View {
 
             VStack(spacing: 0) {
                 Spacer(minLength: 0)
-                Text("\(frame.stars)")
-                    .font(Face.mono(11, .medium))
-                    .foregroundStyle(frame.rejected ? tokens.t3 : q)
-                Text(String(format: "%.2f", frame.hfr))
-                    .font(Face.mono(9))
-                    .foregroundStyle(tokens.t2)
+                if size.showsMetrics {
+                    Text("\(frame.stars)")
+                        .font(Face.mono(11, .medium))
+                        .foregroundStyle(frame.rejected ? tokens.t3 : q)
+                    Text(String(format: "%.2f", frame.hfr))
+                        .font(Face.mono(9))
+                        .foregroundStyle(tokens.t2)
+                }
                 Rectangle().fill(q).frame(height: 2)
             }
             .frame(maxWidth: .infinity)
         }
-        .frame(width: 62, height: Metric.frameCell)
+        .frame(width: size.width, height: size.height(aspect))
         .overlay(
             RoundedRectangle(cornerRadius: Radius.swatch)
                 .stroke(selected ? tokens.selLine : tokens.line, lineWidth: selected ? 1 : 0.5))

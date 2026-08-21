@@ -14,20 +14,25 @@ import Foundation
 /// A migration must be safe to run twice. `Settings.encode` keeps the keys it
 /// found in the file and does not understand, so running an older build against
 /// a newer file writes back what it knows and leaves the rest — but it stamps
-/// its own version, and the newer build will then step those keys forward
-/// again. `Settings.respell` is idempotent because it matches on the old
-/// spelling; anything hand-written has to be too.
+/// its own version, and the newer build then steps those keys forward again.
+/// `Settings.respell` is idempotent because it matches on the old spelling;
+/// anything hand-written has to be too.
 protocol Migratable: Codable {
     init()
-    /// Bumped when `migrate` gains a case. A file with no version is 1.
-    static var version: Int { get }
-    /// One step forward. Called once per intervening version, so a case only
-    /// has to know about its own change and never about the ones after it.
-    static func migrate(_ object: inout [String: Any], to version: Int)
+    /// One entry per format change, oldest first. A file at version *n* has
+    /// had the first *n - 1* applied, so upgrading runs the rest in order —
+    /// v1 to v4 is entries 1, 2 and 3, each knowing only about its own change.
+    ///
+    /// A list rather than a switch on a separately declared version, because
+    /// the version is then `count + 1` rather than a second thing to remember:
+    /// a migration cannot be added without the file version moving, and the
+    /// version cannot move without a migration to justify it.
+    static var migrations: [(inout [String: Any]) -> Void] { get }
 }
 
 extension Migratable {
-    static func migrate(_ object: inout [String: Any], to version: Int) {}
+    static var migrations: [(inout [String: Any]) -> Void] { [] }
+    static var version: Int { migrations.count + 1 }
 }
 
 enum Settings {
@@ -54,11 +59,12 @@ enum Settings {
             let defaults = fields(of: T())
         else { return nil }
 
-        // A file from a newer build is read as far as this one understands it
+        // Every step between the file's version and this build's, in order. A
+        // file from a newer build is read as far as this one understands it
         // rather than migrated backwards.
-        let from = stored[versionKey] as? Int ?? 1
-        if from < T.version {
-            for v in (from + 1)...T.version { T.migrate(&stored, to: v) }
+        let from = max(stored[versionKey] as? Int ?? 1, 1)
+        if from <= T.migrations.count {
+            for step in T.migrations[(from - 1)...] { step(&stored) }
         }
 
         var object = merged(defaults, under: stored)
